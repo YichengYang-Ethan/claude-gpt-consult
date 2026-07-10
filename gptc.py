@@ -524,9 +524,11 @@ def open_new_chat() -> Page:
 
 def find_conversation_page(conv_id: str) -> Page:
     """Attach to the tab showing EXACTLY this conversation, or reopen it and verify the
-    page really landed on /c/<conv_id>. Fails closed rather than attach to a wrong chat."""
-    if not conv_id or conv_id == "unknown":
-        _err("find_conversation_page: no conversation id (fail closed)")
+    page really landed on /c/<conv_id>. Fails closed rather than attach to a wrong chat.
+    Grammar-validates the id FIRST (before any URL is built) so interactive callers can't
+    pass a malformed 'id?leak=DATA' the way the daemon path is already protected against."""
+    if not isinstance(conv_id, str) or not _CONV_ID_RE.fullmatch(conv_id):
+        _err("find_conversation_page: invalid conversation id (fail closed)")
         raise SystemExit(2)
     _die_if_no_chrome()
     for t in _http_json("/json"):
@@ -558,7 +560,17 @@ def newest_chat_page() -> Page | None:
     return Page(pages[0]["webSocketDebuggerUrl"], target_id=pages[0].get("id"))
 
 
-def type_and_send(page: Page, prompt: str) -> None:
+def type_and_send(page: Page, prompt: str, expected_conversation: str | None = None) -> None:
+    """Type the prompt and click send. If expected_conversation is given (follow-ups),
+    re-verify the page is STILL on that exact conversation immediately before typing —
+    closing the TOCTOU gap between attaching to a tab and sending into it. The check lives
+    here so no caller can forget it."""
+    if expected_conversation is not None:
+        actual = conv_id_from_url(page.eval("location.href"))
+        if actual != expected_conversation:
+            _err(f"conversation drifted before send (expected {expected_conversation}, "
+                 f"now {actual}) — fail closed, not sending")
+            raise SystemExit(2)
     if page.eval(_type_js(prompt)) != "typed":
         _err("could not type into the composer (selector drift?)")
         raise SystemExit(2)
@@ -817,7 +829,7 @@ def cmd_followup(a) -> int:
         return 2
     prompt = render_followup(rid, a.task, resolved)
     page = find_conversation_page(a.conversation)
-    type_and_send(page, prompt)
+    type_and_send(page, prompt, expected_conversation=a.conversation)
     page.close()
     out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
     print(json.dumps({"rid": rid, "conversation_id": a.conversation, "out": out,
@@ -1046,7 +1058,7 @@ def _process_job(job: dict) -> None:
         _write_status(rid, {"state": "error", "reason": f"setup (exit {e.code})"})
         return
     try:
-        type_and_send(page, prompt)
+        type_and_send(page, prompt, expected_conversation=(cid if job["kind"] == "followup" else None))
         captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
         state, ans, model = poll_answer(page, rid, timeout, 4.0)
         if state == "done":
