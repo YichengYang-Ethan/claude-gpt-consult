@@ -2,32 +2,31 @@
 """
 gptc — Claude commands GPT.
 
-A tiny bridge that lets a local agent (Claude Code) hand a self-contained job to a
-logged-in ChatGPT tab, get the wrapped answer back, and act on it — using the two
-*subscriptions* you already pay for, no API key and no per-token bill.
+A small bridge that lets a local agent (Claude Code) hand a self-contained job to a
+logged-in ChatGPT tab, wait for the answer in a DETACHED process, and act on it —
+using the two *subscriptions* you already pay for, no API key and no per-token bill.
+
+The workflow (a thread, not a one-shot):
+    submit  -> open a fresh chat, type the prompt, send; return rid + conversation id
+    wait    -> DETACHED poller: re-attach to that conversation, poll to the wrapped
+               answer, write it to a file; its exit wakes the agent
+    followup-> send another round into the same conversation (feed local results back)
+    status  -> one-shot state of a conversation
 
 Design stance (differs from prior art on purpose):
-  * PUBLIC-CODE-ONLY egress. Every consult must reference >=1 public GitHub link,
+  * PUBLIC-CODE-ONLY egress. Every consult carries >=1 public GitHub link,
     gh-confirmed public. The whole rendered prompt is scanned for secret shapes and
-    fails closed on a hit. There is no spoofable "follow-up" exemption.
-  * EXPLICIT, VISIBLE egress. The network send happens only inside a user-invoked
-    `consult`, which prints exactly what it is about to send. We do NOT ship a
-    daemon whose purpose is to move the send off the agent so a safety classifier
-    can't see it. If you run inside a locked-down agent mode that blocks the send,
-    approve it or run `gptc consult` yourself.
+    fails closed. A link-free follow-up requires an explicit --allow-nolink flag
+    (user-controlled), not a spoofable in-prompt substring.
+  * EXPLICIT, VISIBLE egress. The send happens only inside a command you run. This
+    project does NOT ship a daemon whose purpose is to move the send off the agent
+    so a host's data-exfiltration classifier can't see it.
   * Ordinary automation of your OWN logged-in session. The tool never handles your
-    password; you log into a dedicated Chrome profile once, by hand. It reads only
-    the answer text, writes it to a local file you own.
+    password; you log into a dedicated Chrome profile once, by hand.
 
 Note: automating the ChatGPT *web* app is against OpenAI's Terms of Use (which allow
 programmatic extraction only via the API). Use your own account, at human cadence,
 and accept the account-level risk. This tool does not bypass login/CAPTCHA/limits.
-
-Subcommands:
-  launch    open the dedicated debug Chrome; log into ChatGPT there once
-  doctor    check deps, gh auth, Chrome, port, login
-  gate      dry-run the egress gate on a prompt/links (no send)
-  consult   gate -> open a fresh chat -> type -> send -> wait -> write answer
 """
 from __future__ import annotations
 
@@ -49,7 +48,6 @@ PORT = int(os.environ.get("GPTC_PORT", "9333"))
 PROFILE = os.environ.get("GPTC_PROFILE", str(Path.home() / ".gptc-chrome"))
 CHROME = os.environ.get("GPTC_CHROME", "")
 PROJECT_URL = os.environ.get("GPTC_PROJECT_URL", "https://chatgpt.com/")
-STATE_DIR = os.environ.get("GPTC_STATE_DIR", "/tmp/gptc")
 ANSWER_DIR = os.environ.get("GPTC_ANSWER_DIR", str(Path.cwd() / "gptc_answers"))
 ORIGIN = f"http://127.0.0.1:{PORT}"
 
@@ -63,6 +61,8 @@ CHROME_CANDIDATES = [
     "/usr/bin/chromium-browser",
 ]
 
+SELF = os.path.abspath(__file__)
+
 
 def _err(msg: str) -> None:
     print(f"gptc: {msg}", file=sys.stderr)
@@ -71,11 +71,6 @@ def _err(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 # egress gate  (the security heart — deliberately stricter than prior art)
 # --------------------------------------------------------------------------- #
-# Secret-SHAPE detectors. Not a promise of completeness — the primary control is
-# "public links only + you review what you send". But this catches the common
-# credential shapes the field forgets (Anthropic sk-ant-, Stripe sk_live_, and
-# any user:pass@host connection string), which a naive `sk-[A-Za-z0-9]{20}`
-# regex silently misses.
 SECRET_RES: list[tuple[str, re.Pattern]] = [
     ("openai/anthropic-key", re.compile(r"sk-(?:ant-)?[A-Za-z0-9_\-]{16,}")),
     ("stripe-key", re.compile(r"[rs]k_(?:live|test)_[A-Za-z0-9]{16,}")),
@@ -86,9 +81,7 @@ SECRET_RES: list[tuple[str, re.Pattern]] = [
     ("slack-webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+")),
     ("private-key-block", re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
-    # user:pass@host — catches postgres://, mongodb://, redis://, https://u:p@...
     ("conn-string-cred", re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/]+:[^\s:@/]+@[^\s/]+")),
-    # generic assignment: password= / api_key: "..." / bearer <token>
     ("assigned-secret", re.compile(
         r"(?i)\b(?:pass(?:wd|word)?|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|bearer)\b"
         r"\s*[:=]\s*['\"]?[A-Za-z0-9._\-/+]{8,}")),
@@ -99,7 +92,6 @@ _RAW_URL = re.compile(r"raw\.githubusercontent\.com/([^/\s]+)/([^/\s]+)")
 
 
 def scan_secrets(text: str) -> str | None:
-    """Return the name of the first secret shape found, or None if clean."""
     for name, rx in SECRET_RES:
         if rx.search(text):
             return name
@@ -107,22 +99,17 @@ def scan_secrets(text: str) -> str | None:
 
 
 def resolve_link(link: str, allow_gist: bool = False):
-    """Normalize a code reference into {slug, url, kind}. Returns (True, info) or
-    (False, error). Only GitHub references are accepted (we can prove them public)."""
     link = link.strip()
     if "gist.github.com" in link:
         if not allow_gist:
             return False, f"gist links are refused (visibility not cheaply provable): {link}"
         return True, {"slug": None, "url": link, "kind": "gist"}
-    # owner/repo#123  -> PR
     m = re.fullmatch(r"([\w.\-]+/[\w.\-]+)#(\d+)", link)
     if m:
         slug, pr = m.group(1), m.group(2)
         return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{pr}", "kind": "pr"}
-    # bare owner/repo -> whole repo
     if re.fullmatch(r"[\w.\-]+/[\w.\-]+", link):
         return True, {"slug": link, "url": f"https://github.com/{link}", "kind": "repo"}
-    # full URL
     if link.startswith("http"):
         m = _GH_URL.search(link) or _RAW_URL.search(link)
         if m:
@@ -133,8 +120,7 @@ def resolve_link(link: str, allow_gist: bool = False):
 
 
 def _repo_is_public(slug: str) -> bool:
-    """gh-confirm the repo is public. Fails CLOSED on any error (no gh, no auth,
-    private, 404) -> treated as not-public."""
+    """gh-confirm the repo is public. Fails CLOSED on any error."""
     try:
         r = subprocess.run(
             ["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
@@ -160,7 +146,7 @@ def gate(prompt_text: str, links: list[str], allow_gist: bool = False):
         return False, "refusing: no public code link provided (send >=1 public GitHub link)"
     for info in resolved:
         if info["slug"] is None:
-            continue  # gist explicitly allowed above
+            continue
         if not _repo_is_public(info["slug"]):
             return False, f"refusing: repo not gh-confirmed public: {info['slug']}"
     return True, resolved
@@ -170,9 +156,6 @@ def gate(prompt_text: str, links: list[str], allow_gist: bool = False):
 # sentinel parse (canonical Python copy; a JS mirror runs in the page)
 # --------------------------------------------------------------------------- #
 def sentinel_parse(text: str, rid: str) -> str | None:
-    """Extract the answer between bare-line BEGIN_RESPONSE:<rid> / END_RESPONSE:<rid>.
-    Fence-aware: sentinels inside a ``` code fence do not trigger. Returns the answer
-    body, or None if a complete wrapped answer is not present."""
     begin, end = f"BEGIN_RESPONSE:{rid}", f"END_RESPONSE:{rid}"
     in_fence = started = done = False
     buf: list[str] = []
@@ -196,6 +179,19 @@ def sentinel_parse(text: str, rid: str) -> str | None:
     return None
 
 
+_OUTPUT_CONTRACT = """--- OUTPUT CONTRACT (read carefully) ---
+Take as long as you need to reason. When your FINAL answer is ready, print it wrapped
+EXACTLY like this — each sentinel alone on its own line, nothing else on that line,
+and NOT inside a code fence:
+
+BEGIN_RESPONSE:{rid}
+<your complete final answer here>
+END_RESPONSE:{rid}
+
+Emit the BEGIN line exactly once, at the start of the final answer. End the load-bearing
+claims a local agent should re-check with a short `verify locally:` note."""
+
+
 def render_prompt(rid: str, title: str, role: str, task: str, resolved: list[dict]) -> str:
     refs = "\n".join(f"- {i['url']}" for i in resolved)
     return f"""{role}
@@ -207,17 +203,15 @@ TASK: {title}
 CODE — open and read these public GitHub links before answering:
 {refs}
 
---- OUTPUT CONTRACT (read carefully) ---
-Take as long as you need to reason. When your FINAL answer is ready, print it wrapped
-EXACTLY like this — each sentinel alone on its own line, nothing else on that line,
-and NOT inside a code fence:
+""" + _OUTPUT_CONTRACT.format(rid=rid)
 
-BEGIN_RESPONSE:{rid}
-<your complete final answer here>
-END_RESPONSE:{rid}
 
-Emit the BEGIN line exactly once, at the start of the final answer. End the load-bearing
-claims a local agent should re-check with a short `verify locally:` note."""
+def render_followup(rid: str, task: str, resolved: list[dict]) -> str:
+    refs = ("\n\nMore public code for this round:\n" +
+            "\n".join(f"- {i['url']}" for i in resolved)) if resolved else ""
+    return f"""{task}{refs}
+
+""" + _OUTPUT_CONTRACT.format(rid=rid)
 
 
 # --------------------------------------------------------------------------- #
@@ -241,12 +235,13 @@ def _chrome_up() -> bool:
 class Page:
     """A CDP session bound to one page target. Requires `websocket-client`."""
 
-    def __init__(self, ws_url: str):
+    def __init__(self, ws_url: str, target_id: str | None = None):
         try:
             import websocket  # type: ignore
         except ImportError:
             raise SystemExit("gptc: missing dep — run: pip install websocket-client")
         self.ws = websocket.create_connection(ws_url, origin=ORIGIN, timeout=30)
+        self.target_id = target_id
         self._id = 0
 
     def _call(self, method: str, params: dict | None = None):
@@ -262,9 +257,7 @@ class Page:
 
     def eval(self, expression: str):
         r = self._call("Runtime.evaluate", {
-            "expression": expression,
-            "returnByValue": True,
-            "awaitPromise": True,
+            "expression": expression, "returnByValue": True, "awaitPromise": True,
         })
         if "exceptionDetails" in r:
             raise RuntimeError(r["exceptionDetails"].get("text", "js error"))
@@ -276,13 +269,27 @@ class Page:
         except Exception:
             pass
 
+    def close_target(self):
+        """Actually close the browser tab (not just this client connection)."""
+        if not self.target_id:
+            return
+        try:
+            import websocket  # type: ignore
+            ver = _http_json("/json/version")
+            bws = websocket.create_connection(ver["webSocketDebuggerUrl"], origin=ORIGIN, timeout=10)
+            bws.send(json.dumps({"id": 1, "method": "Target.closeTarget",
+                                 "params": {"targetId": self.target_id}}))
+            bws.recv()
+            bws.close()
+        except Exception:
+            pass
+
 
 def open_tab(url: str) -> Page:
     """Create a fresh tab at `url` over the browser endpoint, then attach to it."""
     ver = _http_json("/json/version")
-    browser_ws = ver["webSocketDebuggerUrl"]
     import websocket  # type: ignore
-    bws = websocket.create_connection(browser_ws, origin=ORIGIN, timeout=30)
+    bws = websocket.create_connection(ver["webSocketDebuggerUrl"], origin=ORIGIN, timeout=30)
     try:
         bws.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": url}}))
         target_id = None
@@ -292,11 +299,10 @@ def open_tab(url: str) -> Page:
                 target_id = m["result"]["targetId"]
     finally:
         bws.close()
-    # find the page ws for this target
     for _ in range(40):
         for t in _http_json("/json"):
             if t.get("id") == target_id and t.get("webSocketDebuggerUrl"):
-                return Page(t["webSocketDebuggerUrl"])
+                return Page(t["webSocketDebuggerUrl"], target_id=target_id)
         time.sleep(0.25)
     raise SystemExit("gptc: could not attach to the new tab")
 
@@ -331,7 +337,6 @@ _SEND_JS = (
 
 
 def _extract_js(rid: str) -> str:
-    # returns a JSON string: {state, text?, len}
     return """(function(rid){
       var nodes=document.querySelectorAll('[data-message-author-role="assistant"]');
       var body=(document.body.innerText||'');
@@ -349,6 +354,120 @@ def _extract_js(rid: str) -> str:
       if(started&&done) return JSON.stringify({state:'done',text:buf.join('\\n').trim()});
       return JSON.stringify({state:started?'generating':'thinking',len:text.length});
     })(""" + json.dumps(rid) + ")"
+
+
+# --------------------------------------------------------------------------- #
+# page orchestration helpers
+# --------------------------------------------------------------------------- #
+_CONV_RE = re.compile(r"/c/([0-9a-fA-F][0-9a-fA-F\-]{15,})")
+
+
+def conv_id_from_url(url: str | None) -> str | None:
+    m = _CONV_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _wait_composer(page: Page, tries: int = 120):
+    for _ in range(tries):
+        if page.eval(_COMPOSER_JS):
+            return True
+        if page.eval(_LOGIN_MARKER_JS):
+            return "login"
+        time.sleep(0.5)
+    return False
+
+
+def _die_if_no_chrome():
+    if not _chrome_up():
+        _err(f"debug Chrome not running on {PORT}. Run: gptc launch")
+        raise SystemExit(2)
+
+
+def open_new_chat() -> Page:
+    _die_if_no_chrome()
+    page = open_tab(PROJECT_URL)
+    st = _wait_composer(page)
+    if st == "login":
+        _err("login wall — log into ChatGPT in the debug Chrome window, then retry")
+        raise SystemExit(3)
+    if not st:
+        _err("composer never appeared (login? UI drift?)")
+        raise SystemExit(3)
+    return page
+
+
+def find_conversation_page(conv_id: str) -> Page:
+    _die_if_no_chrome()
+    for t in _http_json("/json"):
+        if (t.get("type") == "page" and conv_id in (t.get("url") or "")
+                and t.get("webSocketDebuggerUrl")):
+            return Page(t["webSocketDebuggerUrl"], target_id=t.get("id"))
+    page = open_tab(f"https://chatgpt.com/c/{conv_id}")
+    st = _wait_composer(page)
+    if st == "login":
+        _err("login wall — log into ChatGPT, then retry")
+        raise SystemExit(3)
+    if not st:
+        _err(f"could not open conversation {conv_id}")
+        raise SystemExit(2)
+    return page
+
+
+def newest_chat_page() -> Page | None:
+    _die_if_no_chrome()
+    pages = [t for t in _http_json("/json")
+             if t.get("type") == "page" and "/c/" in (t.get("url") or "")
+             and t.get("webSocketDebuggerUrl")]
+    if not pages:
+        return None
+    return Page(pages[0]["webSocketDebuggerUrl"], target_id=pages[0].get("id"))
+
+
+def type_and_send(page: Page, prompt: str) -> None:
+    if page.eval(_type_js(prompt)) != "typed":
+        _err("could not type into the composer (selector drift?)")
+        raise SystemExit(2)
+    time.sleep(0.4)
+    send = page.eval(_SEND_JS)
+    if send != "sent":
+        _err(f"could not click send ({send}) — ChatGPT UI may have changed")
+        raise SystemExit(2)
+
+
+def capture_conversation_id(page: Page, timeout: int = 25) -> str | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cid = conv_id_from_url(page.eval("location.href"))
+        if cid:
+            return cid
+        time.sleep(0.5)
+    return None
+
+
+def poll_answer(page: Page, rid: str, timeout: int, poll: float):
+    """Returns (state, answer_or_reason). state in {done, blocker, timeout}."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll)
+        raw = page.eval(_extract_js(rid))
+        st = json.loads(raw) if raw else {"state": "thinking"}
+        if st["state"] == "done":
+            return "done", st["text"]
+        if st["state"] == "blocker":
+            return "blocker", st.get("reason")
+    return "timeout", None
+
+
+def write_answer(rid: str, answer: str, out: str | None) -> Path:
+    p = Path(out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt"))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(answer)
+    return p
+
+
+def _wait_cmd(rid: str, conv: str | None, out: str, timeout: int) -> str:
+    return (f"timeout {timeout + 40} python3 {SELF} wait "
+            f"--rid {rid} --conversation {conv or 'unknown'} --out {out} --timeout {timeout}")
 
 
 # --------------------------------------------------------------------------- #
@@ -397,25 +516,23 @@ def cmd_launch(a) -> int:
 
 def cmd_doctor(a) -> int:
     ok = True
-    # python dep
     try:
         import websocket  # noqa: F401
         print("ok   python dep: websocket-client")
     except ImportError:
         ok = False
         print("FAIL python dep: websocket-client  (pip install websocket-client)")
-    # gh
     g = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if g.returncode == 0:
         print("ok   gh CLI authenticated (egress gate can verify public repos)")
     else:
         ok = False
         print("FAIL gh not authenticated  (run: gh auth login) — the gate fails closed without it")
-    # chrome + port
     if _chrome_up():
         print(f"ok   debug Chrome reachable on 127.0.0.1:{PORT}")
         try:
             p = open_tab("about:blank")
+            p.close_target()
             p.close()
             print("ok   CDP loopback attach works")
         except Exception as e:
@@ -440,79 +557,150 @@ def cmd_gate(a) -> int:
     return 0
 
 
-def cmd_consult(a) -> int:
+def _prep_consult(a):
+    """Shared gate+render for submit/consult. Returns (rid, prompt, resolved) or raises."""
     rid = a.rid or secrets.token_hex(4)
-    resolved_prompt_links = a.link
     role = a.role or "You are a rigorous senior engineer and reviewer."
-    # gate on the FULL rendered prompt (task + role + links), not just the task
-    prompt_preview = f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link)
-    ok, res = gate(prompt_preview, a.link, allow_gist=a.allow_gist)
+    preview = f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link)
+    ok, res = gate(preview, a.link, allow_gist=a.allow_gist)
     if not ok:
         _err(res)
-        return 2
-    prompt = render_prompt(rid, a.title, role, a.task, res)
+        raise SystemExit(2)
+    return rid, render_prompt(rid, a.title, role, a.task, res), res
 
+
+def cmd_consult(a) -> int:
+    """Blocking: submit + wait in one go (interactive convenience)."""
+    rid, prompt, res = _prep_consult(a)
     print(f"gate PASS — sending consult rid={rid} to ChatGPT ({PROJECT_URL}):")
     for i in res:
         print(f"  - {i['url']}")
     print("  task:", a.title)
-
-    if not _chrome_up():
-        _err(f"debug Chrome not running on {PORT}. Run: gptc launch  (then log into ChatGPT)")
-        return 2
-
-    page = open_tab(PROJECT_URL)
+    page = open_new_chat()
     try:
-        # wait for composer / detect login wall
-        for _ in range(120):
-            if page.eval(_COMPOSER_JS):
-                break
-            if page.eval(_LOGIN_MARKER_JS):
-                _err("login wall — log into ChatGPT in the debug Chrome window, then retry")
-                return 3
-            time.sleep(0.5)
-        else:
-            _err("composer never appeared (login? UI drift?)")
+        type_and_send(page, prompt)
+        state, answer = poll_answer(page, rid, a.timeout, a.poll)
+        if state == "blocker":
+            _err(f"blocker: {answer}")
             return 3
-
-        if page.eval(_type_js(prompt)) != "typed":
-            _err("could not type into the composer (selector drift?)")
-            return 2
-        time.sleep(0.4)
-        send = page.eval(_SEND_JS)
-        if send != "sent":
-            _err(f"could not click send ({send}) — ChatGPT UI may have changed")
-            return 2
-
-        deadline = time.time() + a.timeout
-        answer = None
-        while time.time() < deadline:
-            time.sleep(a.poll)
-            raw = page.eval(_extract_js(rid))
-            st = json.loads(raw) if raw else {"state": "thinking"}
-            if st["state"] == "done":
-                answer = st["text"]
-                break
-            if st["state"] == "blocker":
-                _err(f"blocker: {st.get('reason')}")
-                return 3
-        if answer is None:
+        if state == "timeout":
             _err(f"no wrapped answer within {a.timeout}s")
             return 4
-
-        out = Path(a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt"))
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(answer)
+        out = write_answer(rid, answer, a.out)
         print(f"\n=== answer (rid {rid}) -> {out} ===\n")
         print(answer)
         return 0
     finally:
         if a.close_tab:
-            page.close()
+            page.close_target()
+        page.close()
+
+
+def cmd_submit(a) -> int:
+    """Control plane: open chat, type, send, return rid + conversation id + wait_cmd.
+    Does NOT wait — dispatch the printed wait_cmd detached."""
+    rid, prompt, res = _prep_consult(a)
+    page = open_new_chat()
+    type_and_send(page, prompt)
+    cid = capture_conversation_id(page)
+    page.close()  # detach our client; the tab stays open for `wait`
+    out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
+    print(json.dumps({"rid": rid, "conversation_id": cid, "out": out,
+                      "wait_cmd": _wait_cmd(rid, cid, out, a.timeout)}))
+    return 0
+
+
+def cmd_wait(a) -> int:
+    """Detached poller: re-attach to the conversation, poll to the wrapped answer,
+    write it, exit. Exit codes: 0 done / 3 blocker / 4 no-answer / 2 setup."""
+    if a.conversation and a.conversation != "unknown":
+        page = find_conversation_page(a.conversation)
+    else:
+        page = newest_chat_page()
+        if page is None:
+            _err("no ChatGPT conversation tab found to wait on")
+            return 2
+    try:
+        state, answer = poll_answer(page, a.rid, a.timeout, a.poll)
+        if state == "blocker":
+            _err(f"blocker: {answer}")
+            return 3
+        if state == "timeout":
+            _err(f"no wrapped answer within {a.timeout}s")
+            return 4
+        out = write_answer(a.rid, answer, a.out)
+        print(f"answer written -> {out}")
+        return 0
+    finally:
+        if a.close_tab:
+            page.close_target()
+        page.close()
+
+
+def cmd_followup(a) -> int:
+    """Send another round into an existing conversation. Always secret-scanned;
+    requires a public --link unless --allow-nolink is passed explicitly."""
+    rid = a.rid or secrets.token_hex(4)
+    hit = scan_secrets(a.task + "\n" + "\n".join(a.link))
+    if hit:
+        _err(f"refusing: follow-up contains secret-like content ({hit})")
+        return 2
+    resolved: list[dict] = []
+    if a.link:
+        ok, res = gate(a.task + "\n" + "\n".join(a.link), a.link, allow_gist=a.allow_gist)
+        if not ok:
+            _err(res)
+            return 2
+        resolved = res
+    elif not a.allow_nolink:
+        _err("refusing: link-free follow-up. Add --link, or pass --allow-nolink to confirm "
+             "this round carries no private data.")
+        return 2
+    prompt = render_followup(rid, a.task, resolved)
+    page = find_conversation_page(a.conversation)
+    type_and_send(page, prompt)
+    page.close()
+    out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
+    print(json.dumps({"rid": rid, "conversation_id": a.conversation, "out": out,
+                      "wait_cmd": _wait_cmd(rid, a.conversation, out, a.timeout)}))
+    return 0
+
+
+def cmd_status(a) -> int:
+    if a.conversation and a.conversation != "unknown":
+        page = find_conversation_page(a.conversation)
+    else:
+        page = newest_chat_page()
+        if page is None:
+            print(json.dumps({"state": "no-tab"}))
+            return 2
+    try:
+        print(page.eval(_extract_js(a.rid)) or json.dumps({"state": "thinking"}))
+        return 0
+    finally:
+        page.close()
+
+
+# --------------------------------------------------------------------------- #
+# arg parsing
+# --------------------------------------------------------------------------- #
+def _add_consult_args(p):
+    p.add_argument("--task", required=True, help="the question / instruction")
+    p.add_argument("--title", default="consult", help="short headline")
+    p.add_argument("--role", default="", help="persona for ChatGPT")
+    p.add_argument("--link", action="append", default=[], required=True,
+                   help="public GitHub ref: owner/repo, owner/repo#PR, or a github.com URL")
+    p.add_argument("--out", default="", help="answer file (default gptc_answers/answer_<rid>.txt)")
+    p.add_argument("--rid", default="", help="fixed request id (default random)")
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--poll", type=float, default=4.0)
+    p.add_argument("--allow-gist", action="store_true")
+    p.add_argument("--close-tab", action="store_true")
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(prog="gptc", description="Claude commands GPT (public-links-only, explicit egress).")
+    p = argparse.ArgumentParser(prog="gptc",
+                                description="Claude commands GPT (public-links-only, explicit egress).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("launch", help="open the dedicated debug Chrome").set_defaults(fn=cmd_launch)
@@ -524,19 +712,39 @@ def main() -> int:
     g.add_argument("--allow-gist", action="store_true")
     g.set_defaults(fn=cmd_gate)
 
-    c = sub.add_parser("consult", help="gate -> open chat -> type -> send -> wait -> write")
-    c.add_argument("--task", required=True, help="the question / instruction")
-    c.add_argument("--title", default="consult", help="short headline")
-    c.add_argument("--role", default="", help="persona for ChatGPT")
-    c.add_argument("--link", action="append", default=[], required=True,
-                   help="public GitHub ref: owner/repo, owner/repo#PR, or a github.com URL (repeatable)")
-    c.add_argument("--out", default="", help="answer file (default gptc_answers/answer_<rid>.txt)")
-    c.add_argument("--rid", default="", help="fixed request id (default random)")
-    c.add_argument("--timeout", type=int, default=900)
-    c.add_argument("--poll", type=float, default=4.0)
-    c.add_argument("--allow-gist", action="store_true")
-    c.add_argument("--close-tab", action="store_true", help="close the ChatGPT tab when done")
+    c = sub.add_parser("consult", help="blocking: submit + wait in one go")
+    _add_consult_args(c)
     c.set_defaults(fn=cmd_consult)
+
+    s = sub.add_parser("submit", help="control plane: send, return rid + conversation id (no wait)")
+    _add_consult_args(s)
+    s.set_defaults(fn=cmd_submit)
+
+    w = sub.add_parser("wait", help="detached poller: wait for the wrapped answer, write it")
+    w.add_argument("--rid", required=True)
+    w.add_argument("--conversation", default="unknown")
+    w.add_argument("--out", default="")
+    w.add_argument("--timeout", type=int, default=900)
+    w.add_argument("--poll", type=float, default=4.0)
+    w.add_argument("--close-tab", action="store_true")
+    w.set_defaults(fn=cmd_wait)
+
+    f = sub.add_parser("followup", help="send another round into an existing conversation")
+    f.add_argument("--conversation", required=True)
+    f.add_argument("--task", required=True)
+    f.add_argument("--link", action="append", default=[])
+    f.add_argument("--allow-nolink", action="store_true",
+                   help="permit a follow-up with no public link (you confirm no private data)")
+    f.add_argument("--out", default="")
+    f.add_argument("--rid", default="")
+    f.add_argument("--timeout", type=int, default=900)
+    f.add_argument("--allow-gist", action="store_true")
+    f.set_defaults(fn=cmd_followup)
+
+    st = sub.add_parser("status", help="one-shot state of a conversation")
+    st.add_argument("--rid", required=True)
+    st.add_argument("--conversation", default="unknown")
+    st.set_defaults(fn=cmd_status)
 
     a = p.parse_args()
     return a.fn(a)
