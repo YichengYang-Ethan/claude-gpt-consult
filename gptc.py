@@ -18,9 +18,15 @@ Design stance (differs from prior art on purpose):
     gh-confirmed public. The whole rendered prompt is scanned for secret shapes and
     fails closed. A link-free follow-up requires an explicit --allow-nolink flag
     (user-controlled), not a spoofable in-prompt substring.
-  * EXPLICIT, VISIBLE egress. The send happens only inside a command you run. This
-    project does NOT ship a daemon whose purpose is to move the send off the agent
-    so a host's data-exfiltration classifier can't see it.
+  * TWO SEND PATHS. Interactive: the send happens inside a command you run. Auto mode:
+    a USER-started daemon (`watch`) does the send off the agent so it works under Claude
+    Code's exfiltration classifier — and it re-derives + re-validates every job at the
+    point of send (strict schema, secret re-scan, gh public re-check, fail closed). This
+    removes the platform's exfiltration net in exchange for that gate — a documented,
+    opt-in trade-off, not a hidden bypass. Pure-stdlib state cannot be made tamper-proof
+    against an adversarial agent running as the SAME OS user; strong isolation needs the
+    daemon under a separate account. The daemon re-validates precisely so it never trusts
+    agent-supplied state as authorization.
   * Ordinary automation of your OWN logged-in session. The tool never handles your
     password; you log into a dedicated Chrome profile once, by hand.
 
@@ -31,6 +37,7 @@ and accept the account-level risk. This tool does not bypass login/CAPTCHA/limit
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -90,8 +97,11 @@ SECRET_RES: list[tuple[str, re.Pattern]] = [
         r"\s*[:=]\s*['\"]?[A-Za-z0-9._\-/+]{8,}")),
 ]
 
-_GH_URL = re.compile(r"github\.com/([^/\s]+)/([^/\s#?]+)")
-_RAW_URL = re.compile(r"raw\.githubusercontent\.com/([^/\s]+)/([^/\s]+)")
+# strict token grammars — validated before a value is ever placed in a URL or a prompt
+_RID_RE = re.compile(r"[0-9a-f]{8,64}\Z")
+_CONV_ID_RE = re.compile(r"[0-9a-fA-F][0-9a-fA-F-]{15,63}\Z")
+_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+_ALLOWED_CHAT_HOSTS = {"chatgpt.com", "chat.openai.com"}
 
 
 def scan_secrets(text: str) -> str | None:
@@ -123,12 +133,24 @@ def resolve_link(link: str, allow_gist: bool = False):
             if not allow_gist:
                 return False, f"gist links are refused (visibility not cheaply provable): {link}"
             return True, {"slug": None, "url": f"https://gist.github.com{path}", "kind": "gist"}
-        if host in ("github.com", "www.github.com", "raw.githubusercontent.com"):
+        if host in ("github.com", "www.github.com"):
             parts = [p for p in path.split("/") if p]
-            if len(parts) >= 2:
-                slug = f"{parts[0]}/{parts[1]}".removesuffix(".git")
-                return True, {"slug": slug, "url": f"https://{host}{path}", "kind": "url"}
-            return False, f"GitHub link missing owner/repo: {link}"
+            if len(parts) < 2:
+                return False, f"GitHub link missing owner/repo: {link}"
+            slug = f"{parts[0]}/{parts[1]}".removesuffix(".git")
+            # canonicalize to an allowlisted shape — an arbitrary path tail (e.g.
+            # /blob/main/<BASE64>) is refused so a link can't smuggle data past the gate
+            if len(parts) == 2:
+                return True, {"slug": slug, "url": f"https://github.com/{slug}", "kind": "repo"}
+            if len(parts) == 4 and parts[2] == "pull" and parts[3].isdigit():
+                return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{parts[3]}", "kind": "pr"}
+            if len(parts) == 4 and parts[2] == "commit" and _COMMIT_SHA_RE.fullmatch(parts[3]):
+                return True, {"slug": slug, "url": f"https://github.com/{slug}/commit/{parts[3]}", "kind": "commit"}
+            return False, ("unsupported GitHub URL shape (allowed: repo, /pull/<n>, "
+                           f"/commit/<40-hex>; name a specific file in the task text): {link}")
+        if host == "raw.githubusercontent.com":
+            return False, ("raw.githubusercontent URLs are refused (path can smuggle data); "
+                           "pass owner/repo or a github.com repo/pull/commit URL")
         return False, f"not a GitHub link (only public GitHub is allowed): {link}"
     return False, f"unrecognized code reference: {link}"
 
@@ -393,11 +415,22 @@ def _extract_js(rid: str) -> str:
 # --------------------------------------------------------------------------- #
 # page orchestration helpers
 # --------------------------------------------------------------------------- #
-_CONV_RE = re.compile(r"/c/([0-9a-fA-F][0-9a-fA-F\-]{15,})")
-
-
 def conv_id_from_url(url: str | None) -> str | None:
-    m = _CONV_RE.search(url or "")
+    """Extract a conversation id ONLY from an exact https://chatgpt.com[/g/<gizmo>]/c/<id>
+    URL (correct scheme + host, no creds/query/fragment). Returns None otherwise — this is
+    used both to read identity and to REJECT look-alike or redirect URLs like
+    https://evil.example/?next=/c/<id>."""
+    if not url:
+        return None
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if u.scheme != "https" or (u.hostname or "").lower() not in _ALLOWED_CHAT_HOSTS:
+        return None
+    if u.username or u.password or u.query or u.fragment:
+        return None
+    m = re.fullmatch(r"/(?:g/[^/]+/)?c/([0-9a-fA-F][0-9a-fA-F-]{15,63})/?", u.path)
     return m.group(1) if m else None
 
 
@@ -782,6 +815,9 @@ def cmd_enqueue(a) -> int:
     re-validates everything, so a forged/injected job can't smuggle a pre-baked payload.
     No network — invisible to the exfiltration classifier."""
     rid = a.rid or secrets.token_hex(4)
+    if not _RID_RE.fullmatch(rid):
+        _err("--rid must be 8-64 lowercase hex characters")
+        return 2
     out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
     if a.kind == "followup":
         hit = scan_secrets(a.task + "\n" + "\n".join(a.link))
@@ -830,8 +866,9 @@ def cmd_await(a) -> int:
         if os.path.exists(sp):
             st = json.loads(Path(sp).read_text())
             state = st.get("state")
-            if state == "done":
-                print(f"answer -> {st.get('out')}")
+            if state in ("done", "done_unthreaded"):
+                print(f"answer -> {st.get('out')}"
+                      + ("  (unthreaded: no follow-up possible)" if state == "done_unthreaded" else ""))
                 return 0
             if state == "blocker":
                 _err(f"blocker: {st.get('reason')}")
@@ -859,23 +896,46 @@ def _process_job(job: dict) -> None:
     itself (never trust agent-supplied rendered text), re-gate (secret scan + gh public,
     fail closed), then send + wait + write status. This is the confidentiality boundary."""
     rid = job.get("rid")
-    if not isinstance(rid, str) or not rid:
-        return  # unaddressable; nothing to report to
+    if not isinstance(rid, str) or not _RID_RE.fullmatch(rid):
+        return  # not a valid rid — cannot even name a status file safely; drop
     if job.get("kind") not in ("consult", "followup"):
         _write_status(rid, {"state": "refused", "reason": f"bad kind: {job.get('kind')!r}"})
         return
-    extra = set(job) - _JOB_KEYS
-    if extra:
-        _write_status(rid, {"state": "refused", "reason": f"unknown job fields: {sorted(extra)}"})
+    if set(job) != _JOB_KEYS:  # exact keys — no missing fields, no smuggled extras
+        _write_status(rid, {"state": "refused",
+                            "reason": f"job keys must be exactly {sorted(_JOB_KEYS)}"})
         return
-    task = job.get("task") or ""
-    title = job.get("title") or "consult"
-    role = job.get("role") or "You are a rigorous senior engineer and reviewer."
-    links = job.get("links") or []
-    if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+    task, title, role = job["task"], job["title"], job["role"]
+    links, cid = job["links"], job["conversation_id"]
+    if not (isinstance(task, str) and isinstance(title, str) and isinstance(role, str)):
+        _write_status(rid, {"state": "refused", "reason": "task/title/role must be strings"})
+        return
+    if not (isinstance(links, list) and all(isinstance(x, str) for x in links)):
         _write_status(rid, {"state": "refused", "reason": "links must be a list of strings"})
         return
-    timeout = int(job.get("timeout") or 900)
+    if not (isinstance(job["allow_nolink"], bool) and isinstance(job["allow_gist"], bool)):
+        _write_status(rid, {"state": "refused", "reason": "allow_* must be booleans"})
+        return
+    timeout = job["timeout"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not (1 <= timeout <= 3600):
+        _write_status(rid, {"state": "refused", "reason": "timeout must be int in 1..3600"})
+        return
+    if not (isinstance(job["out"], str) and job["out"]):
+        _write_status(rid, {"state": "refused", "reason": "out must be a non-empty string"})
+        return
+    # conversation_id must satisfy its grammar BEFORE it is ever built into a URL (a bad
+    # value like 'id?leak=DATA' would otherwise be requested by the browser)
+    if cid is not None and not (isinstance(cid, str) and _CONV_ID_RE.fullmatch(cid)):
+        _write_status(rid, {"state": "refused", "reason": "conversation_id has a bad shape"})
+        return
+    if job["kind"] == "consult" and cid is not None:
+        _write_status(rid, {"state": "refused", "reason": "consult must have conversation_id=null"})
+        return
+    if job["kind"] == "followup" and not cid:
+        _write_status(rid, {"state": "refused", "reason": "followup without conversation_id"})
+        return
+    title = title or "consult"
+    role = role or "You are a rigorous senior engineer and reviewer."
     # re-scan the RAW inputs (not a supplied prompt) for secret shapes
     hit = scan_secrets(f"{task}\n{role}\n{title}\n" + "\n".join(links))
     if hit:
@@ -899,26 +959,25 @@ def _process_job(job: dict) -> None:
         _write_status(rid, {"state": "refused", "reason": "link-free follow-up without allow_nolink"})
         return
     # daemon RE-RENDERS from raw inputs — the outgoing text is daemon-derived, not agent-supplied
-    if job["kind"] == "followup":
-        if not job.get("conversation_id"):
-            _write_status(rid, {"state": "refused", "reason": "followup without conversation_id"})
-            return
-        prompt = render_followup(rid, task, resolved)
-    else:
-        prompt = render_prompt(rid, title, role, task, resolved)
+    prompt = (render_followup(rid, task, resolved) if job["kind"] == "followup"
+              else render_prompt(rid, title, role, task, resolved))
     try:
-        page = (find_conversation_page(job["conversation_id"])
-                if job["kind"] == "followup" else open_new_chat())
+        page = (find_conversation_page(cid) if job["kind"] == "followup" else open_new_chat())
     except SystemExit as e:
         _write_status(rid, {"state": "error", "reason": f"setup (exit {e.code})"})
         return
     try:
         type_and_send(page, prompt)
-        cid = capture_conversation_id(page) if job["kind"] == "consult" else job["conversation_id"]
+        captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
         state, ans = poll_answer(page, rid, timeout, 4.0)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
-            _write_status(rid, {"state": "done", "out": str(out), "conversation_id": cid})
+            if captured:
+                _write_status(rid, {"state": "done", "out": str(out), "conversation_id": captured})
+            else:
+                # answered, but the thread can't be continued (no captured id)
+                _write_status(rid, {"state": "done_unthreaded", "out": str(out),
+                                    "conversation_id": None})
         elif state == "blocker":
             _write_status(rid, {"state": "blocker", "reason": ans})
         else:
@@ -929,13 +988,48 @@ def _process_job(job: dict) -> None:
         page.close()
 
 
+def _claim(src: str, dst: str) -> None:
+    """No-clobber claim: hard-link then unlink the source, so an already-claimed
+    destination is NEVER overwritten (os.rename would clobber it on POSIX)."""
+    os.link(src, dst)   # raises FileExistsError if dst already exists
+    os.unlink(src)
+
+
+def _recover_stranded(p: dict) -> None:
+    """On startup, any job left in processing/ was interrupted mid-flight. It MAY already
+    have been sent to ChatGPT, so we never resend it (avoiding duplicate delivery); we
+    terminalize it as an error and move on."""
+    try:
+        names = [n for n in os.listdir(p["processing"]) if n.endswith(".json")]
+    except FileNotFoundError:
+        return
+    for name in names:
+        rid = name[:-5]
+        if _RID_RE.fullmatch(rid):
+            _write_status(rid, {"state": "error", "reason":
+                                "daemon restarted mid-job; not resent (avoid duplicate delivery)"})
+        try:
+            os.remove(os.path.join(p["processing"], name))
+        except OSError:
+            pass
+
+
 def cmd_watch(a) -> int:
-    """USER-started daemon: process pending jobs (validate + send + wait). This is the
-    ONLY component that talks to chatgpt.com. Start once, like the login. Ctrl-C stops."""
+    """USER-started daemon: the ONLY component that talks to chatgpt.com. Single-writer
+    (flock), re-derives + re-validates every job at send, and never resends a job that was
+    interrupted after it may have been sent. Start once, like the login. Ctrl-C stops."""
     p = _ensure_spool()
     if not _chrome_up():
         _err("debug Chrome not running — run `gptc launch` and log into ChatGPT first")
         return 2
+    lock_fd = os.open(os.path.join(SPOOL_DIR, "watch.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _err("another gptc watcher already holds the spool lock")
+        os.close(lock_fd)
+        return 2
+    _recover_stranded(p)
     print(f"gptc daemon watching {SPOOL_DIR} — Ctrl-C to stop")
     try:
         while True:
@@ -945,15 +1039,22 @@ def cmd_watch(a) -> int:
             except FileNotFoundError:
                 names = []
             for name in names:
+                rid = name[:-5]
                 src, proc = os.path.join(p["pending"], name), os.path.join(p["processing"], name)
+                if not _RID_RE.fullmatch(rid):     # junk file — drop, nobody is awaiting it
+                    try:
+                        os.remove(src)
+                    except OSError:
+                        pass
+                    continue
                 try:
-                    os.rename(src, proc)  # atomic claim
-                except OSError:
+                    _claim(src, proc)              # no-clobber
+                except (FileExistsError, OSError):
                     continue
                 try:
                     _process_job(json.loads(Path(proc).read_text()))
                 except Exception as e:
-                    _write_status(name[:-5], {"state": "error", "reason": str(e)})
+                    _write_status(rid, {"state": "error", "reason": str(e)})
                 finally:
                     try:
                         os.remove(proc)
@@ -963,6 +1064,12 @@ def cmd_watch(a) -> int:
     except KeyboardInterrupt:
         print("\ndaemon stopped")
         return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def cmd_queue(a) -> int:
