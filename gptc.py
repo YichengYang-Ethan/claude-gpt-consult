@@ -38,6 +38,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.parse
 import secrets
 from pathlib import Path
 
@@ -101,22 +102,33 @@ def scan_secrets(text: str) -> str | None:
 
 
 def resolve_link(link: str, allow_gist: bool = False):
+    """Resolve a code reference into {slug, url, kind}. URLs are parsed strictly
+    (exact hostname, no substring match) and stripped of query/fragment so a link
+    cannot smuggle a data payload past the gate. Returns (True, info) or (False, err)."""
     link = link.strip()
-    if "gist.github.com" in link:
-        if not allow_gist:
-            return False, f"gist links are refused (visibility not cheaply provable): {link}"
-        return True, {"slug": None, "url": link, "kind": "gist"}
+    # owner/repo#123 -> PR ; bare owner/repo -> repo
     m = re.fullmatch(r"([\w.\-]+/[\w.\-]+)#(\d+)", link)
     if m:
         slug, pr = m.group(1), m.group(2)
         return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{pr}", "kind": "pr"}
     if re.fullmatch(r"[\w.\-]+/[\w.\-]+", link):
         return True, {"slug": link, "url": f"https://github.com/{link}", "kind": "repo"}
-    if link.startswith("http"):
-        m = _GH_URL.search(link) or _RAW_URL.search(link)
-        if m:
-            slug = f"{m.group(1)}/{m.group(2)}".removesuffix(".git")
-            return True, {"slug": slug, "url": link, "kind": "url"}
+    if link.startswith(("http://", "https://")):
+        u = urllib.parse.urlparse(link)
+        host = (u.hostname or "").lower()
+        if u.username or u.password:
+            return False, f"link carries embedded credentials, refused: {link}"
+        path = u.path  # query + fragment are dropped on purpose
+        if host == "gist.github.com":
+            if not allow_gist:
+                return False, f"gist links are refused (visibility not cheaply provable): {link}"
+            return True, {"slug": None, "url": f"https://gist.github.com{path}", "kind": "gist"}
+        if host in ("github.com", "www.github.com", "raw.githubusercontent.com"):
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2:
+                slug = f"{parts[0]}/{parts[1]}".removesuffix(".git")
+                return True, {"slug": slug, "url": f"https://{host}{path}", "kind": "url"}
+            return False, f"GitHub link missing owner/repo: {link}"
         return False, f"not a GitHub link (only public GitHub is allowed): {link}"
     return False, f"unrecognized code reference: {link}"
 
@@ -419,9 +431,14 @@ def open_new_chat() -> Page:
 
 
 def find_conversation_page(conv_id: str) -> Page:
+    """Attach to the tab showing EXACTLY this conversation, or reopen it and verify the
+    page really landed on /c/<conv_id>. Fails closed rather than attach to a wrong chat."""
+    if not conv_id or conv_id == "unknown":
+        _err("find_conversation_page: no conversation id (fail closed)")
+        raise SystemExit(2)
     _die_if_no_chrome()
     for t in _http_json("/json"):
-        if (t.get("type") == "page" and conv_id in (t.get("url") or "")
+        if (t.get("type") == "page" and conv_id_from_url(t.get("url")) == conv_id
                 and t.get("webSocketDebuggerUrl")):
             return Page(t["webSocketDebuggerUrl"], target_id=t.get("id"))
     page = open_tab(f"https://chatgpt.com/c/{conv_id}")
@@ -431,6 +448,10 @@ def find_conversation_page(conv_id: str) -> Page:
         raise SystemExit(3)
     if not st:
         _err(f"could not open conversation {conv_id}")
+        raise SystemExit(2)
+    if conv_id_from_url(page.eval("location.href")) != conv_id:
+        page.close()
+        _err(f"conversation {conv_id} did not load (redirected? deleted?) — fail closed")
         raise SystemExit(2)
     return page
 
@@ -630,6 +651,10 @@ def cmd_submit(a) -> int:
     type_and_send(page, prompt)
     cid = capture_conversation_id(page)
     page.close()  # detach our client; the tab stays open for `wait`
+    if not cid:
+        _err("could not capture conversation id (slow navigation?) — not emitting an "
+             "'unknown' wait; retry the submit")
+        return 2
     out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
     print(json.dumps({"rid": rid, "conversation_id": cid, "out": out,
                       "wait_cmd": _wait_cmd(rid, cid, out, a.timeout)}))
@@ -638,14 +663,12 @@ def cmd_submit(a) -> int:
 
 def cmd_wait(a) -> int:
     """Detached poller: re-attach to the conversation, poll to the wrapped answer,
-    write it, exit. Exit codes: 0 done / 3 blocker / 4 no-answer / 2 setup."""
-    if a.conversation and a.conversation != "unknown":
-        page = find_conversation_page(a.conversation)
-    else:
-        page = newest_chat_page()
-        if page is None:
-            _err("no ChatGPT conversation tab found to wait on")
-            return 2
+    write it, exit. Exit codes: 0 done / 3 blocker / 4 no-answer / 2 setup.
+    Requires a real conversation id — fails closed rather than guess a tab."""
+    if not a.conversation or a.conversation == "unknown":
+        _err("wait requires a valid --conversation id (fail closed; no tab guessing)")
+        return 2
+    page = find_conversation_page(a.conversation)
     try:
         state, answer = poll_answer(page, a.rid, a.timeout, a.poll)
         if state == "blocker":
@@ -754,8 +777,10 @@ def _write_status(rid: str, st: dict) -> None:
 
 
 def cmd_enqueue(a) -> int:
-    """AGENT side, LOCAL only: gate locally (secret scan + link syntax), render, write a
-    job file. No network — invisible to the exfiltration classifier."""
+    """AGENT side, LOCAL only: gate locally (secret scan + link syntax) and write a job of
+    RAW inputs — never a rendered prompt or derived slugs. The daemon re-derives and
+    re-validates everything, so a forged/injected job can't smuggle a pre-baked payload.
+    No network — invisible to the exfiltration classifier."""
     rid = a.rid or secrets.token_hex(4)
     out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
     if a.kind == "followup":
@@ -763,32 +788,28 @@ def cmd_enqueue(a) -> int:
         if hit:
             _err(f"refusing: follow-up contains secret-like content ({hit})")
             return 2
-        resolved: list[dict] = []
         if a.link:
             ok, res = gate_local(a.task + "\n" + "\n".join(a.link), a.link, a.allow_gist)
             if not ok:
                 _err(res)
                 return 2
-            resolved = res
         elif not a.allow_nolink:
             _err("refusing: link-free follow-up. Add --link or --allow-nolink.")
             return 2
-        prompt = render_followup(rid, a.task, resolved)
-        job = {"rid": rid, "kind": "followup", "prompt": prompt,
-               "slugs": [i["slug"] for i in resolved if i["slug"]],
-               "conversation_id": a.conversation, "allow_nolink": bool(a.allow_nolink),
-               "timeout": a.timeout, "out": out}
+        if not a.conversation:
+            _err("refusing: follow-up needs --conversation")
+            return 2
     else:
         role = a.role or "You are a rigorous senior engineer and reviewer."
-        preview = f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link)
-        ok, res = gate_local(preview, a.link, a.allow_gist)
+        ok, res = gate_local(f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link),
+                             a.link, a.allow_gist)
         if not ok:
             _err(res)
             return 2
-        prompt = render_prompt(rid, a.title, role, a.task, res)
-        job = {"rid": rid, "kind": "consult", "prompt": prompt,
-               "slugs": [i["slug"] for i in res if i["slug"]],
-               "conversation_id": None, "timeout": a.timeout, "out": out}
+    job = {"rid": rid, "kind": a.kind, "task": a.task, "title": a.title,
+           "role": a.role, "links": list(a.link), "allow_nolink": bool(a.allow_nolink),
+           "allow_gist": bool(a.allow_gist), "conversation_id": a.conversation or None,
+           "timeout": a.timeout, "out": out}
     p = _ensure_spool()
     _atomic_write(os.path.join(p["pending"], f"{rid}.json"), json.dumps(job))
     res_out = {"rid": rid, "out": out, "queued": True, "daemon_running": _daemon_alive(),
@@ -829,23 +850,62 @@ def cmd_await(a) -> int:
     return 4
 
 
+_JOB_KEYS = {"rid", "kind", "task", "title", "role", "links", "allow_nolink",
+             "allow_gist", "conversation_id", "timeout", "out"}
+
+
 def _process_job(job: dict) -> None:
-    """Daemon: re-validate at the point of send, then send + wait + write status."""
-    rid = job["rid"]
-    hit = scan_secrets(job["prompt"])
+    """Daemon: validate a RAW job against a strict schema, RE-DERIVE the prompt + slugs
+    itself (never trust agent-supplied rendered text), re-gate (secret scan + gh public,
+    fail closed), then send + wait + write status. This is the confidentiality boundary."""
+    rid = job.get("rid")
+    if not isinstance(rid, str) or not rid:
+        return  # unaddressable; nothing to report to
+    if job.get("kind") not in ("consult", "followup"):
+        _write_status(rid, {"state": "refused", "reason": f"bad kind: {job.get('kind')!r}"})
+        return
+    extra = set(job) - _JOB_KEYS
+    if extra:
+        _write_status(rid, {"state": "refused", "reason": f"unknown job fields: {sorted(extra)}"})
+        return
+    task = job.get("task") or ""
+    title = job.get("title") or "consult"
+    role = job.get("role") or "You are a rigorous senior engineer and reviewer."
+    links = job.get("links") or []
+    if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+        _write_status(rid, {"state": "refused", "reason": "links must be a list of strings"})
+        return
+    timeout = int(job.get("timeout") or 900)
+    # re-scan the RAW inputs (not a supplied prompt) for secret shapes
+    hit = scan_secrets(f"{task}\n{role}\n{title}\n" + "\n".join(links))
     if hit:
         _write_status(rid, {"state": "refused", "reason": f"secret-like content ({hit})"})
         return
-    for slug in job.get("slugs", []):
-        if not _repo_is_public(slug):
-            _write_status(rid, {"state": "refused", "reason": f"repo not public: {slug}"})
+    resolved: list[dict] = []
+    if links:
+        ok, res = resolve_all(links, bool(job.get("allow_gist")))
+        if not ok:
+            _write_status(rid, {"state": "refused", "reason": res})
             return
-    if job["kind"] == "consult" and not job.get("slugs"):
+        okp, resp = gate_public(res)
+        if not okp:
+            _write_status(rid, {"state": "refused", "reason": resp})
+            return
+        resolved = res
+    if job["kind"] == "consult" and not resolved:
         _write_status(rid, {"state": "refused", "reason": "no public link"})
         return
-    if job["kind"] == "followup" and not job.get("slugs") and not job.get("allow_nolink"):
+    if job["kind"] == "followup" and not resolved and not job.get("allow_nolink"):
         _write_status(rid, {"state": "refused", "reason": "link-free follow-up without allow_nolink"})
         return
+    # daemon RE-RENDERS from raw inputs — the outgoing text is daemon-derived, not agent-supplied
+    if job["kind"] == "followup":
+        if not job.get("conversation_id"):
+            _write_status(rid, {"state": "refused", "reason": "followup without conversation_id"})
+            return
+        prompt = render_followup(rid, task, resolved)
+    else:
+        prompt = render_prompt(rid, title, role, task, resolved)
     try:
         page = (find_conversation_page(job["conversation_id"])
                 if job["kind"] == "followup" else open_new_chat())
@@ -853,11 +913,12 @@ def _process_job(job: dict) -> None:
         _write_status(rid, {"state": "error", "reason": f"setup (exit {e.code})"})
         return
     try:
-        type_and_send(page, job["prompt"])
-        state, ans = poll_answer(page, rid, job["timeout"], 4.0)
+        type_and_send(page, prompt)
+        cid = capture_conversation_id(page) if job["kind"] == "consult" else job["conversation_id"]
+        state, ans = poll_answer(page, rid, timeout, 4.0)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
-            _write_status(rid, {"state": "done", "out": str(out)})
+            _write_status(rid, {"state": "done", "out": str(out), "conversation_id": cid})
         elif state == "blocker":
             _write_status(rid, {"state": "blocker", "reason": ans})
         else:
