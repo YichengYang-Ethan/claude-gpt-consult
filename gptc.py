@@ -231,28 +231,52 @@ def gate(prompt_text: str, links: list[str], allow_gist: bool = False):
 # --------------------------------------------------------------------------- #
 # sentinel parse (canonical Python copy; a JS mirror runs in the page)
 # --------------------------------------------------------------------------- #
+def _fence_open(stripped: str):
+    """Return (char, length) if the line opens/closes a code fence (>=3 of ` or ~),
+    else None. Delimiter-aware so a ``` inside a ~~~ block can't desync the parser."""
+    m = re.match(r"(`{3,}|~{3,})", stripped)
+    return (m.group(1)[0], len(m.group(1))) if m else None
+
+
 def sentinel_parse(text: str, rid: str) -> str | None:
+    """Extract the answer between bare-line BEGIN_RESPONSE:<rid> / END_RESPONSE:<rid>.
+    Fence-aware with delimiter tracking (a closing fence must be the same char and at
+    least as long), so 4-backtick / ~~~ blocks don't false-trigger. Returns None until a
+    complete wrapped answer is present."""
     begin, end = f"BEGIN_RESPONSE:{rid}", f"END_RESPONSE:{rid}"
-    in_fence = started = done = False
+    fence = None  # (char, length) when inside a fence, else None
+    started = done = False
     buf: list[str] = []
     for line in text.split("\n"):
         t = line.strip()
-        if t.startswith("```"):
-            in_fence = not in_fence
+        f = _fence_open(t)
+        if f:
+            if fence is None:
+                fence = f
+            elif f[0] == fence[0] and f[1] >= fence[1]:
+                fence = None
             if started:
                 buf.append(line)
             continue
         if not started:
-            if not in_fence and t == begin:
+            if fence is None and t == begin:
                 started = True
             continue
-        if not in_fence and t == end:
+        if fence is None and t == end:
             done = True
             break
         buf.append(line)
     if started and done:
         return "\n".join(buf).strip()
     return None
+
+
+def model_downgrade_warning(model: str | None, expect: str) -> str | None:
+    """If an expected-model substring is configured and the answering model doesn't match,
+    return a warning string (used to flag a silent Plus-tier downgrade). Else None."""
+    if not expect or not model:
+        return None
+    return None if expect.lower() in model.lower() else f"answered by {model!r}, expected ~{expect!r}"
 
 
 _OUTPUT_CONTRACT = """--- OUTPUT CONTRACT (read carefully) ---
@@ -413,22 +437,37 @@ _SEND_JS = (
 
 
 def _extract_js(rid: str) -> str:
+    # Correlate to OUR request: pick the assistant node whose text carries our BEGIN
+    # sentinel (not the globally-last node), read its model slug, and report whether the
+    # model is still generating — so poll_answer can require a stable, finished answer.
     return """(function(rid){
-      var nodes=document.querySelectorAll('[data-message-author-role="assistant"]');
+      var begin='BEGIN_RESPONSE:'+rid, end='END_RESPONSE:'+rid;
       var body=(document.body.innerText||'');
       if(/you've reached|rate limit|too many requests/i.test(body))
         return JSON.stringify({state:'blocker',reason:'rate-limit'});
-      if(!nodes.length) return JSON.stringify({state:'waiting',len:0});
-      var el=nodes[nodes.length-1]; var text=el.textContent||'';
-      var begin='BEGIN_RESPONSE:'+rid, end='END_RESPONSE:'+rid;
-      var lines=text.split('\\n'); var inF=false,started=false,done=false,buf=[];
-      for(var i=0;i<lines.length;i++){var ln=lines[i],t=ln.trim();
-        if(t.indexOf('```')===0){inF=!inF; if(started)buf.push(ln); continue;}
-        if(!started){ if(!inF&&t===begin)started=true; continue; }
-        if(!inF&&t===end){done=true;break;}
+      var generating=!!document.querySelector('button[data-testid="stop-button"]');
+      var nodes=document.querySelectorAll('[data-message-author-role="assistant"]');
+      var el=null;
+      for(var i=nodes.length-1;i>=0;i--){
+        if((nodes[i].textContent||'').indexOf(begin)!==-1){el=nodes[i];break;}
+      }
+      if(!el) return JSON.stringify({state:generating?'generating':'thinking',generating:generating});
+      var model=null, mo=el.closest('[data-message-model-slug]');
+      if(mo) model=mo.getAttribute('data-message-model-slug');
+      var text=el.textContent||'';
+      var lines=text.split('\\n'); var fence=null,started=false,done=false,buf=[];
+      for(var j=0;j<lines.length;j++){var ln=lines[j],t=ln.trim();
+        var fm=t.match(/^(`{3,}|~{3,})/);
+        if(fm){var ch=fm[1][0],len=fm[1].length;
+          if(fence===null){fence=[ch,len];}
+          else if(ch===fence[0]&&len>=fence[1]){fence=null;}
+          if(started)buf.push(ln); continue;}
+        if(!started){ if(fence===null&&t===begin)started=true; continue; }
+        if(fence===null&&t===end){done=true;break;}
         buf.push(ln);}
-      if(started&&done) return JSON.stringify({state:'done',text:buf.join('\\n').trim()});
-      return JSON.stringify({state:started?'generating':'thinking',len:text.length});
+      if(started&&done)
+        return JSON.stringify({state:'done',text:buf.join('\\n').trim(),model:model,generating:generating});
+      return JSON.stringify({state:'generating',generating:generating,model:model});
     })(""" + json.dumps(rid) + ")"
 
 
@@ -541,17 +580,28 @@ def capture_conversation_id(page: Page, timeout: int = 25) -> str | None:
 
 
 def poll_answer(page: Page, rid: str, timeout: int, poll: float):
-    """Returns (state, answer_or_reason). state in {done, blocker, timeout}."""
+    """Poll our request's answer node to a STABLE, finished result. Returns
+    (state, answer_or_reason, model). state in {done, blocker, timeout}. A wrapped answer
+    is accepted only once generation has stopped AND the text is unchanged across two
+    polls — so content streamed after END_RESPONSE can't be truncated."""
     deadline = time.time() + timeout
+    last_done = None
+    model = None
     while time.time() < deadline:
         time.sleep(poll)
         raw = page.eval(_extract_js(rid))
         st = json.loads(raw) if raw else {"state": "thinking"}
-        if st["state"] == "done":
-            return "done", st["text"]
+        model = st.get("model") or model
         if st["state"] == "blocker":
-            return "blocker", st.get("reason")
-    return "timeout", None
+            return "blocker", st.get("reason"), model
+        if st["state"] == "done":
+            text = st["text"]
+            if last_done == text and not st.get("generating"):
+                return "done", text, model      # stable + stopped -> accept
+            last_done = text                     # first sighting (or still changing) -> re-poll
+            continue
+        last_done = None                         # not done yet -> reset stability tracking
+    return "timeout", None, model
 
 
 def write_answer(rid: str, answer: str, out: str | None) -> Path:
@@ -679,7 +729,7 @@ def cmd_consult(a) -> int:
     page = open_new_chat()
     try:
         type_and_send(page, prompt)
-        state, answer = poll_answer(page, rid, a.timeout, a.poll)
+        state, answer, model = poll_answer(page, rid, a.timeout, a.poll)
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
@@ -687,7 +737,11 @@ def cmd_consult(a) -> int:
             _err(f"no wrapped answer within {a.timeout}s")
             return 4
         out = write_answer(rid, answer, a.out)
-        print(f"\n=== answer (rid {rid}) -> {out} ===\n")
+        warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
+        print(f"\n=== answer (rid {rid}, model {model or '?'}) -> {out} ===")
+        if warn:
+            _err(f"MODEL WARNING: {warn}")
+        print()
         print(answer)
         return 0
     finally:
@@ -723,7 +777,7 @@ def cmd_wait(a) -> int:
         return 2
     page = find_conversation_page(a.conversation)
     try:
-        state, answer = poll_answer(page, a.rid, a.timeout, a.poll)
+        state, answer, model = poll_answer(page, a.rid, a.timeout, a.poll)
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
@@ -731,7 +785,10 @@ def cmd_wait(a) -> int:
             _err(f"no wrapped answer within {a.timeout}s")
             return 4
         out = write_answer(a.rid, answer, a.out)
-        print(f"answer written -> {out}")
+        warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
+        print(f"answer written -> {out}  (model {model or '?'})")
+        if warn:
+            _err(f"MODEL WARNING: {warn}")
         return 0
     finally:
         if a.close_tab:
@@ -887,8 +944,10 @@ def cmd_await(a) -> int:
             st = json.loads(Path(sp).read_text())
             state = st.get("state")
             if state in ("done", "done_unthreaded"):
-                print(f"answer -> {st.get('out')}"
+                print(f"answer -> {st.get('out')}  (model {st.get('model') or '?'})"
                       + ("  (unthreaded: no follow-up possible)" if state == "done_unthreaded" else ""))
+                if st.get("model_warning"):
+                    _err(f"MODEL WARNING: {st['model_warning']}")
                 return 0
             if state == "blocker":
                 _err(f"blocker: {st.get('reason')}")
@@ -989,15 +1048,15 @@ def _process_job(job: dict) -> None:
     try:
         type_and_send(page, prompt)
         captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
-        state, ans = poll_answer(page, rid, timeout, 4.0)
+        state, ans, model = poll_answer(page, rid, timeout, 4.0)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
-            if captured:
-                _write_status(rid, {"state": "done", "out": str(out), "conversation_id": captured})
-            else:
-                # answered, but the thread can't be continued (no captured id)
-                _write_status(rid, {"state": "done_unthreaded", "out": str(out),
-                                    "conversation_id": None})
+            st = {"out": str(out), "conversation_id": captured, "model": model}
+            warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
+            if warn:
+                st["model_warning"] = warn
+            st["state"] = "done" if captured else "done_unthreaded"
+            _write_status(rid, st)
         elif state == "blocker":
             _write_status(rid, {"state": "blocker", "reason": ans})
         else:

@@ -8,6 +8,28 @@ import gptc  # noqa: E402
 RID = "abcd1234"
 
 
+def test_tilde_fence_does_not_desync():
+    # a ~~~ block quoting END must not close the answer early (delimiter-aware fences)
+    txt = (f"BEGIN_RESPONSE:{RID}\nreal answer\n~~~\nEND_RESPONSE:{RID}\n~~~\n"
+           f"still the answer\nEND_RESPONSE:{RID}")
+    out = gptc.sentinel_parse(txt, RID)
+    assert out is not None and "still the answer" in out and "real answer" in out
+
+
+def test_four_backtick_fence_tracked():
+    txt = (f"BEGIN_RESPONSE:{RID}\n````\ncode with ``` inside\n````\n"
+           f"after\nEND_RESPONSE:{RID}")
+    out = gptc.sentinel_parse(txt, RID)
+    assert out is not None and "after" in out and "code with ``` inside" in out
+
+
+def test_model_downgrade_warning():
+    assert gptc.model_downgrade_warning("gpt-5-6-thinking", "thinking") is None
+    assert gptc.model_downgrade_warning("gpt-5-6-mini", "thinking") is not None
+    assert gptc.model_downgrade_warning(None, "thinking") is None
+    assert gptc.model_downgrade_warning("gpt-5-6-mini", "") is None
+
+
 def test_clean_wrapped_answer():
     txt = f"thinking...\nBEGIN_RESPONSE:{RID}\nHere is the answer.\nLine two.\nEND_RESPONSE:{RID}\ntrailing"
     assert gptc.sentinel_parse(txt, RID) == "Here is the answer.\nLine two."

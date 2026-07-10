@@ -149,14 +149,20 @@ timeout · `2` setup error (e.g. Chrome not running).
 | `GPTC_PROFILE` | `~/.gptc-chrome` | dedicated Chrome profile dir |
 | `GPTC_CHROME` | auto-detect | explicit browser binary |
 | `GPTC_ANSWER_DIR` | `./gptc_answers` | where answers are written |
+| `GPTC_EXPECT_MODEL` | unset | substring of the model you pinned (e.g. `thinking`); if the answer came from a different model, a downgrade warning is surfaced (read-only, never selects) |
 
 ## What this version does NOT do (yet)
 
-- No automated model-picker selection (set it once in the tab). Under unattended use,
-  set the tier in the ChatGPT window so a silent downgrade can't weaken answers.
+- No automated model-picker *selection* — you pin the strongest tier once in the ChatGPT
+  window. The tool does **detect** which model actually answered (`data-message-model-slug`)
+  and, if `GPTC_EXPECT_MODEL` is set, warns on a silent Plus-tier downgrade.
+- Answer completion is request-correlated (it reads the assistant node carrying *this*
+  request's sentinel, not the global last node) and only accepts a wrapped answer once
+  generation has stopped and the text is stable — so concurrent rounds don't cross and
+  post-`END` streaming isn't truncated.
 - The live CDP path (drive chatgpt.com) is not unit-tested — it can't be without a
-  logged-in session. The gate, sentinel parser, workflow plumbing, and spool/daemon
-  validation are tested (`pytest`, 25 passing).
+  logged-in session. The gate, sentinel parser, workflow plumbing, spool/daemon validation,
+  and model-warning logic are tested (`pytest`, 39 passing).
 
 ## Security notes
 
