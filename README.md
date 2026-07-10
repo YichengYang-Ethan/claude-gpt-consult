@@ -1,42 +1,63 @@
 # gptc — Claude commands GPT
 
-> A **Claude Code skill + CLI** that turns a logged-in **ChatGPT Pro** tab into a
-> background coprocessor for your local agent. Claude fires off a self-contained job —
-> a plan, a hard reasoning problem, a code review — keeps working locally, and a
-> **detached waiter wakes it** when the full answer lands, ready to verify.
-> It drives the **web app you're already logged into** — not the API — so there's
-> **no key and no per-token bill**.
+> A **Claude Code skill + CLI** that turns a logged-in **ChatGPT** tab into a background
+> coprocessor for your local agent. Claude fires off a self-contained job — a plan, a hard
+> reasoning problem, a code review — keeps working locally, and a **detached waiter wakes it**
+> when the full answer lands, ready to verify. It drives the **web app you're already logged
+> into** — not the API — so there's **no key and no per-token bill**.
 
 Claude drives locally; a dedicated Chrome tab logged into ChatGPT does the background
-reasoning. A consult is a **thread, not a one-shot**: feed local verification results
-back and follow up in the same conversation until the answer is clean.
+reasoning. A consult is a **thread, not a one-shot**: feed local results back and follow up
+in the same conversation until the answer is clean. A small, honest reimplementation of
+[`open-claude-gpt`](https://github.com/fitz-s/open-claude-gpt), then hardened over a
+multi-round GPT-vs-itself security review (see the commit history).
 
-This is a small, honest reimplementation of the idea behind
-[`open-claude-gpt`](https://github.com/fitz-s/open-claude-gpt), rebuilt around two
-principles the original bends:
+## What it does (capabilities)
 
-1. **Public-code-only egress, enforced by construction.** Every consult carries ≥1
-   public GitHub link, `gh`-confirmed public. The whole prompt is scanned for secret
-   shapes and **fails closed** — catching the shapes the field forgets (`sk-ant-`,
-   `sk_live_`, any `user:pass@host` connection string). A link-free follow-up requires
-   an explicit `--allow-nolink` **flag** (user-controlled), not a spoofable in-prompt
-   substring.
-2. **Two send paths, both honest about what they do.** *Interactive* — the send happens
-   inside a command you run. *Auto mode* — a **user-started daemon** does the send off the
-   agent so it works under Claude Code's auto-mode data-exfiltration classifier, and it
-   **re-validates every job at the point of send** (whole-prompt secret re-scan + `gh`
-   public re-check, fail closed). This removes the platform's exfiltration net in exchange
-   for that gate — a **documented, opt-in trade-off**, not a hidden bypass. Keep the gate
-   strong; never widen it to "any link + free text" (the failure mode of the original).
+- **Background reasoning on the subscription you already pay for** — no API key, no token
+  bill. ChatGPT **advises**; your local agent **verifies and executes**.
+- **Full workflow, both attended and unattended:**
+  - *Interactive:* `consult` (blocking) or `submit → detached wait → wake → followup`.
+  - *Auto mode:* `enqueue → watch (daemon) → await`. The agent only touches local files;
+    a user-started daemon does the send, so it works under Claude Code's auto-mode
+    data-exfiltration classifier.
+- **Public-GitHub-only egress, enforced by construction.** Every consult carries ≥1 public
+  GitHub link, `gh`-confirmed public **and confirmed to exist** (fake `/commit/<sha>` or
+  `/pull/<n>` covert channels are refused). The whole prompt is secret-scanned and **fails
+  closed** — catching shapes the field forgets (`sk-ant-`, `sk_live_`, `user:pass@host`).
+- **The daemon is the confidentiality boundary.** It takes only **raw inputs** (never an
+  agent-supplied rendered prompt), enforces a strict job schema + token grammars, and
+  **re-derives + re-validates** every job at the point of send (secret re-scan, gh public +
+  object-existence re-check), fail closed. Single-writer (`flock`); never resends a job
+  interrupted after a possible send.
+- **Reliable multi-round threads.** Completion is **request-correlated** (reads the answer
+  node carrying *this* request's `BEGIN_RESPONSE:<rid>`, not the global last node), accepted
+  only once generation has stopped and the text is stable (no post-`END` truncation), with
+  a delimiter-aware fence parser. Conversation identity is host/path-exact and re-verified
+  immediately before every send (no cross-thread sends).
+- **Model transparency.** Reads which model actually answered (`data-message-model-slug`);
+  set `GPTC_EXPECT_MODEL=<substr>` to get warned on a silent Plus-tier downgrade.
 
-## ⚠️ Read this first
+## Where the line is (boundaries — read before trusting it)
 
-Automating the ChatGPT **web app** is **against OpenAI's Terms of Use** (which permit
-programmatic extraction only through the API). This tool does not bypass login, CAPTCHA,
-or rate limits — but the automated extraction itself is the part OpenAI restricts.
-Realistic risk is *low-probability, high-consequence*: if the account is flagged, the
-penalty is your whole ChatGPT account. **Run it on a secondary/throwaway account, at
-human cadence, not your primary one.** You accept that risk by using this.
+- **Against OpenAI's Terms of Use.** Automating the ChatGPT *web app* is prohibited (the API
+  is the only sanctioned programmatic path). It does **not** bypass login/CAPTCHA/limits, but
+  the automated extraction itself is the restricted part. Risk is *low-probability,
+  high-consequence*: a flagged account can be lost. **Use a secondary account, at human
+  cadence — not your primary.** You accept that by using this.
+- **A trusted-user convenience tool, not a prompt-injection-proof boundary.** The `--task`
+  text is inherently outbound, and regex can't catch obfuscated data (base64/hex/source) a
+  *prompt-injected* agent might place there. In auto mode there's no human to approve the
+  send, so this residual is **accepted by design**. Point it only at work you'd be comfortable
+  disclosing; don't treat the gate as a safe against a hijacked agent.
+- **Same-OS-user limit.** Pure-stdlib spool state can't be made tamper-proof against another
+  process running as *you*. Strong isolation would need the daemon under a separate account.
+- **The live CDP path can break when OpenAI ships UI changes** (selectors have no stability
+  contract) — it fails **closed/loud**, not silently. Not unit-testable in-repo; the gate,
+  parser, plumbing, and model logic are (`pytest`).
+- **Not yet done (non-blocking):** durable `send_intent` state machine (current recovery is
+  conservative — never resends), unwrapped-answer salvage on timeout, model *auto-selection*
+  (by design — you pin the tier in the tab; the tool only detects/​warns).
 
 ## How it works
 
