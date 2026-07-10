@@ -148,3 +148,23 @@ def test_link_repo_pull_commit_canonicalize():
 def test_conv_id_url_must_be_exact_host():
     assert gptc.conv_id_from_url("https://evil.example/?next=/c/0123456789abcdef") is None
     assert gptc.conv_id_from_url("https://chatgpt.com/c/0123456789abcdef") == "0123456789abcdef"
+
+
+# --- covert-channel guard: object must EXIST, gists refused (GPT round-5 finding) --------
+def test_gate_public_refuses_gist():
+    ok, reason = gptc.gate_public([{"slug": None, "url": "https://gist.github.com/a/b", "kind": "gist"}])
+    assert not ok and "gist" in reason
+
+
+def test_gate_public_refuses_fake_commit(monkeypatch):
+    monkeypatch.setattr(gptc, "_repo_is_public", lambda s: True)
+    monkeypatch.setattr(gptc, "_gh_ok", lambda p: False)  # object not found
+    ok, reason = gptc.gate_public([{"slug": "o/r", "url": "u", "kind": "commit", "ref": "a" * 40}])
+    assert not ok and "covert-channel guard" in reason
+
+
+def test_gate_public_allows_real_pr(monkeypatch):
+    monkeypatch.setattr(gptc, "_repo_is_public", lambda s: True)
+    monkeypatch.setattr(gptc, "_gh_ok", lambda p: True)  # object exists
+    ok, res = gptc.gate_public([{"slug": "o/r", "url": "u", "kind": "pr", "ref": "42"}])
+    assert ok

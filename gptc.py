@@ -120,7 +120,7 @@ def resolve_link(link: str, allow_gist: bool = False):
     m = re.fullmatch(r"([\w.\-]+/[\w.\-]+)#(\d+)", link)
     if m:
         slug, pr = m.group(1), m.group(2)
-        return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{pr}", "kind": "pr"}
+        return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{pr}", "kind": "pr", "ref": pr}
     if re.fullmatch(r"[\w.\-]+/[\w.\-]+", link):
         return True, {"slug": link, "url": f"https://github.com/{link}", "kind": "repo"}
     if link.startswith(("http://", "https://")):
@@ -143,9 +143,11 @@ def resolve_link(link: str, allow_gist: bool = False):
             if len(parts) == 2:
                 return True, {"slug": slug, "url": f"https://github.com/{slug}", "kind": "repo"}
             if len(parts) == 4 and parts[2] == "pull" and parts[3].isdigit():
-                return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{parts[3]}", "kind": "pr"}
+                return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{parts[3]}",
+                              "kind": "pr", "ref": parts[3]}
             if len(parts) == 4 and parts[2] == "commit" and _COMMIT_SHA_RE.fullmatch(parts[3]):
-                return True, {"slug": slug, "url": f"https://github.com/{slug}/commit/{parts[3]}", "kind": "commit"}
+                return True, {"slug": slug, "url": f"https://github.com/{slug}/commit/{parts[3]}",
+                              "kind": "commit", "ref": parts[3]}
             return False, ("unsupported GitHub URL shape (allowed: repo, /pull/<n>, "
                            f"/commit/<40-hex>; name a specific file in the task text): {link}")
         if host == "raw.githubusercontent.com":
@@ -189,14 +191,32 @@ def gate_local(prompt_text: str, links: list[str], allow_gist: bool = False):
     return resolve_all(links, allow_gist)
 
 
+def _gh_ok(api_path: str) -> bool:
+    """True iff `gh api <path>` succeeds. Fails CLOSED on any error/no-gh."""
+    try:
+        r = subprocess.run(["gh", "api", api_path, "--silent"],
+                           capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
 def gate_public(resolved: list[dict]):
-    """NETWORK gate: gh-confirm every repo is public. Fails closed. Runs in the daemon
-    (or in submit/consult), never on the classifier-guarded agent side."""
+    """NETWORK gate: gh-confirm every repo is public AND that the referenced object
+    actually EXISTS. The latter closes covert channels — a /commit/<40-hex> or
+    /pull/<digits> whose value is attacker-chosen data (not a real object) is refused,
+    as are gists (visibility/existence unprovable). Fails closed. Runs in the daemon
+    or in submit/consult, never on the classifier-guarded agent side."""
     for info in resolved:
-        if info["slug"] is None:
-            continue
+        if info["slug"] is None:  # gist — cannot prove public or that the object exists
+            return False, "refusing: gists are not allowed (visibility/existence unprovable)"
         if not _repo_is_public(info["slug"]):
             return False, f"refusing: repo not gh-confirmed public: {info['slug']}"
+        kind, ref = info.get("kind"), info.get("ref")
+        if kind == "pr" and not _gh_ok(f"repos/{info['slug']}/pulls/{ref}"):
+            return False, f"refusing: PR #{ref} not found in {info['slug']} (covert-channel guard)"
+        if kind == "commit" and not _gh_ok(f"repos/{info['slug']}/commits/{ref}"):
+            return False, f"refusing: commit {ref} not found in {info['slug']} (covert-channel guard)"
     return True, resolved
 
 
