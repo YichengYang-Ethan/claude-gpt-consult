@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# gptc launcher — runs the sibling gptc.py with the current Python.
+here="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$here/../gptc.py" "$@"
