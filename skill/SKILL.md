@@ -51,8 +51,8 @@ If the JSON shows `"daemon_running": false`, STOP and ask the USER to run `gptc 
 ```bash
 # 2. Await DETACHED — dispatch the printed await_cmd with the Bash tool and
 #    run_in_background: true, then go do other local work. Its exit wakes you.
-#    (the timeout prefix is already in await_cmd — keep it; never nohup & disown)
-timeout 960 python3 $SCRIPT await --rid <rid> --out <out> --timeout 900
+#    (await enforces its own deadline — no GNU timeout prefix; never nohup & disown)
+python3 $SCRIPT await --rid <rid> --out <out> --timeout 900
 ```
 
 ```
@@ -89,8 +89,34 @@ python3 $SCRIPT consult --title "..." --task "..." --link owner/repo#123
 - `--title`: sharp headline. `--role`: persona matched to the job (reviewer / systems
   architect / algorithms specialist). `--task`: the question **plus** what to focus on
   and the exact output you want (a verdict + confidence, a phased plan, a proof).
-- Set the model tier and (optionally) your project once in the ChatGPT window — this
-  version does not automate the model picker.
+
+## Pick the tier — YOU decide (`--mode`)
+The tool actuates + verifies the tier and **fails closed** if it can't reach it; the
+*judgement* of which tier a task needs is yours. Default to Chat; escalate deliberately.
+- **`--mode work`** (Sol **Ultra** — the strongest effort tier) — deep architecture review, large /
+  multi-file PRs, hard algorithmic or proof work, multi-step agentic planning; anything
+  where a wrong answer is expensive and you'll act on it. Slower, burns the Ultra-tier quota.
+- **`--mode chat`** (Sol *Pro*) — quick factual lookups, short summaries, sanity-checking a
+  small snippet, a low-stakes second opinion. Faster, cheaper.
+- Omit `--mode` to leave the tab on whatever tier it's already set to.
+- A **Pro/Ultra answer legitimately takes minutes** — don't read a long wait as "stuck".
+  Give `work` jobs a generous `--timeout` (e.g. 1800) and let the detached waiter do its job.
+
+## Start fresh vs. follow up — YOU decide (context hygiene)
+- **New chat** (`consult`/`submit`, or `enqueue --kind consult`) when: the task is
+  topically unrelated to the current thread; you want an *unbiased* opinion (prior context
+  would anchor it); the thread has run long (~4-5 rounds) and stale context risks polluting
+  the answer; or you're switching mode/tier.
+- **Follow-up** (same thread) when: feeding local verification results back on the *same*
+  task, or iterating where ChatGPT's built-up understanding helps.
+- When a thread has drifted across topics, branch fresh and re-seed only the load-bearing
+  facts + the public links — a shorter, focused thread answers better.
+
+## Private repos (`--private`)
+- Only for consulting on code you OWN, via ChatGPT's own GitHub connector (authorize it in
+  the ChatGPT window once). The prompt is still secret-scanned and the repo is still
+  gh-existence-checked; the connector-fetched CONTENT is inherently outside the gate — the
+  control is *you chose the repo*. Never point it at code that isn't yours to disclose.
 
 ## Roles (keep distinct)
 - **ChatGPT = external advisor.** Its plan/review/analysis is advisory input.

@@ -21,10 +21,11 @@ multi-round GPT-vs-itself security review (see the commit history).
   - *Auto mode:* `enqueue → watch (daemon) → await`. The agent only touches local files;
     a user-started daemon does the send, so it works under Claude Code's auto-mode
     data-exfiltration classifier.
-- **Public-GitHub-only egress, enforced by construction.** Every consult carries ≥1 public
-  GitHub link, `gh`-confirmed public **and confirmed to exist** (fake `/commit/<sha>` or
+- **Public-GitHub-only egress by default, enforced by construction.** Every consult carries
+  ≥1 GitHub link, `gh`-confirmed public **and confirmed to exist** (fake `/commit/<sha>` or
   `/pull/<n>` covert channels are refused). The whole prompt is secret-scanned and **fails
   closed** — catching shapes the field forgets (`sk-ant-`, `sk_live_`, `user:pass@host`).
+  `--private` is a per-job opt-in that drops *only* the public assertion (see boundaries).
 - **The daemon is the confidentiality boundary.** It takes only **raw inputs** (never an
   agent-supplied rendered prompt), enforces a strict job schema + token grammars, and
   **re-derives + re-validates** every job at the point of send (secret re-scan, gh public +
@@ -35,8 +36,18 @@ multi-round GPT-vs-itself security review (see the commit history).
   only once generation has stopped and the text is stable (no post-`END` truncation), with
   a delimiter-aware fence parser. Conversation identity is host/path-exact and re-verified
   immediately before every send (no cross-thread sends).
+- **Tier selection, verified.** `--mode chat` pins Sol *Pro* (fast); `--mode work` pins Sol
+  *Ultra*, the strongest effort tier (deep) — reached via the Advanced → Effort submenu, since
+  the simple power slider caps a rung below Ultra. The tool actuates the Chat/Work toggle +
+  model picker, **reads back what actually took, and fails closed** if it can't reach the
+  requested tier — it never silently answers on a weaker one. Which tier a task needs is the
+  caller's call, not a hardcoded heuristic.
 - **Model transparency.** Reads which model actually answered (`data-message-model-slug`);
   set `GPTC_EXPECT_MODEL=<substr>` to get warned on a silent Plus-tier downgrade.
+- **Private repos are an explicit opt-in.** By default egress is public-GitHub-only. Pass
+  `--private` (per job) to consult on code you OWN via ChatGPT's own GitHub connector — the
+  prompt is still secret-scanned and the repo still gh-existence-checked, but the connector's
+  fetched CONTENT is outside the gate. See the boundary note below before using it.
 
 ## Where the line is (boundaries — read before trusting it)
 
@@ -50,14 +61,23 @@ multi-round GPT-vs-itself security review (see the commit history).
   *prompt-injected* agent might place there. In auto mode there's no human to approve the
   send, so this residual is **accepted by design**. Point it only at work you'd be comfortable
   disclosing; don't treat the gate as a safe against a hijacked agent.
+- **`--private` is a deliberate posture change — understand it.** With `--private`, egress is
+  no longer public-only: ChatGPT's GitHub connector can read repos your account can see,
+  through a channel the prompt-text gate never inspects (the secret scan and gh-existence
+  check still run; the fetched file *content* does not pass through gptc at all). This is an
+  explicit per-job opt-in, off by default, and it is honored on **both** paths — including the
+  unattended daemon. That means in auto mode a prompt-injected agent could enqueue a private
+  job with no human at the send; the owner accepts this by passing `--private`. Use it only
+  for code that is yours to disclose to OpenAI.
 - **Same-OS-user limit.** Pure-stdlib spool state can't be made tamper-proof against another
   process running as *you*. Strong isolation would need the daemon under a separate account.
 - **The live CDP path can break when OpenAI ships UI changes** (selectors have no stability
   contract) — it fails **closed/loud**, not silently. Not unit-testable in-repo; the gate,
   parser, plumbing, and model logic are (`pytest`).
 - **Not yet done (non-blocking):** durable `send_intent` state machine (current recovery is
-  conservative — never resends), unwrapped-answer salvage on timeout, model *auto-selection*
-  (by design — you pin the tier in the tab; the tool only detects/​warns).
+  conservative — never resends), unwrapped-answer salvage on timeout. Tier *selection* is now
+  done (`--mode`, verified + fail-closed); the picker actuation is the most UI-fragile part
+  and, like the rest of the CDP path, breaks loud on a ChatGPT redesign.
 
 ## How it works
 
@@ -127,6 +147,12 @@ its `SKILL.md` and orchestrates the arc for you. You can also drive the CLI by h
   --task "Review the locking in this PR for races; verdict + confidence." \
   --link owner/repo#123
 
+# pick the tier: chat=Sol Pro (fast) / work=Sol Ultra (deep). Verified + fail-closed.
+./bin/gptc consult --mode work --title "Deep review" --task "..." --link owner/repo#123
+
+# consult your OWN private repo via ChatGPT's GitHub connector (explicit opt-in)
+./bin/gptc consult --mode work --private --task "..." --link me/private-repo
+
 # background: submit returns rid + conversation_id + the exact wait_cmd
 ./bin/gptc submit  --title "..." --task "..." --link owner/repo#123
 # then run the printed wait_cmd detached; its exit wakes the caller
@@ -174,16 +200,18 @@ timeout · `2` setup error (e.g. Chrome not running).
 
 ## What this version does NOT do (yet)
 
-- No automated model-picker *selection* — you pin the strongest tier once in the ChatGPT
-  window. The tool does **detect** which model actually answered (`data-message-model-slug`)
-  and, if `GPTC_EXPECT_MODEL` is set, warns on a silent Plus-tier downgrade.
+- Tier *selection* IS automated (`--mode chat|work`, actuated + read back + fail-closed), but
+  it pins **effort/tier**, not the model family — the account's default model (e.g. GPT-5.6
+  Sol) is assumed; pin a different family once in the ChatGPT window. The tool also **detects**
+  which model actually answered (`data-message-model-slug`) and, if `GPTC_EXPECT_MODEL` is
+  set, warns on a silent downgrade.
 - Answer completion is request-correlated (it reads the assistant node carrying *this*
   request's sentinel, not the global last node) and only accepts a wrapped answer once
   generation has stopped and the text is stable — so concurrent rounds don't cross and
   post-`END` streaming isn't truncated.
 - The live CDP path (drive chatgpt.com) is not unit-tested — it can't be without a
   logged-in session. The gate, sentinel parser, workflow plumbing, spool/daemon validation,
-  and model-warning logic are tested (`pytest`, 39 passing).
+  tier/model logic, and heartbeat plumbing are tested (`pytest`, 74 passing).
 
 ## Security notes
 
