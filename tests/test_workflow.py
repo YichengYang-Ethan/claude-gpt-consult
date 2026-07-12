@@ -73,3 +73,18 @@ def test_type_and_send_new_chat_skips_identity_check():
     # new-chat path (expected_conversation=None) must not require a /c/ url
     page = _FakePage("https://chatgpt.com/")
     gptc.type_and_send(page, "hi")  # no raise
+
+
+# --- emitted commands must be portable (no GNU `timeout` — absent on stock macOS) ----
+def test_wait_cmd_is_portable():
+    cmd = gptc._wait_cmd("deadbeef", "2222222222222222", "/tmp/o.txt", 900)
+    assert cmd.startswith("python3 ")
+    assert " wait " in cmd and "--timeout 900" in cmd
+    assert not cmd.startswith("timeout ")
+
+
+def test_await_cmd_is_portable():
+    cmd = gptc._await_cmd("deadbeef", "/tmp/o.txt", 900)
+    assert cmd.startswith("python3 ")
+    assert " await " in cmd and "--timeout 900" in cmd
+    assert "timeout 960" not in cmd

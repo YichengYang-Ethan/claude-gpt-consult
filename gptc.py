@@ -41,6 +41,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -591,29 +593,75 @@ def capture_conversation_id(page: Page, timeout: int = 25) -> str | None:
     return None
 
 
-def poll_answer(page: Page, rid: str, timeout: int, poll: float):
+_RECONNECT_BACKOFF = (1.0, 2.0, 4.0)  # bounded re-attach schedule per outage
+
+
+def _cdp_drop_excs() -> tuple:
+    """Exception families meaning 'the CDP transport died' (retryable by re-attach),
+    vs page/CDP-level errors (RuntimeError) which must stay loud. WebSocketException
+    covers ConnectionClosed and the 30s recv timeout a half-open socket presents as;
+    ConnectionError covers raw-socket resets escaping ws.send."""
+    try:
+        import websocket  # type: ignore
+        return (websocket.WebSocketException, ConnectionError)
+    except ImportError:
+        return (ConnectionError,)
+
+
+def poll_answer(page: Page, rid: str, timeout: int, poll: float,
+                conversation_id: str | None = None):
     """Poll our request's answer node to a STABLE, finished result. Returns
-    (state, answer_or_reason, model). state in {done, blocker, timeout}. A wrapped answer
-    is accepted only once generation has stopped AND the text is unchanged across two
-    polls — so content streamed after END_RESPONSE can't be truncated."""
+    (state, answer_or_reason, model, page). state in {done, blocker, timeout}. A wrapped
+    answer is accepted only once generation has stopped AND the text is unchanged across
+    two polls — so content streamed after END_RESPONSE can't be truncated.
+    A transient CDP drop is survived by re-attaching to `conversation_id` (bounded
+    retries with backoff, fail closed if the conversation is truly gone). The returned
+    `page` is the LIVE one — callers must close it, not the page they passed in."""
+    drop_excs = _cdp_drop_excs()
     deadline = time.time() + timeout
     last_done = None
     model = None
+    drops = 0
     while time.time() < deadline:
         time.sleep(poll)
-        raw = page.eval(_extract_js(rid))
+        try:
+            raw = page.eval(_extract_js(rid))
+            drops = 0                            # healthy again -> reset outage budget
+        except drop_excs as e:
+            drops += 1
+            page.close()                         # detach the dead client; NEVER close_target
+            if conversation_id is None:
+                _err(f"cdp connection lost ({type(e).__name__}) and no conversation id "
+                     "to re-attach — fail closed")
+                raise SystemExit(2)
+            if drops > len(_RECONNECT_BACKOFF):
+                _err(f"cdp connection dropped {drops} times without a successful poll "
+                     "— giving up")
+                raise SystemExit(2)
+            if time.time() >= deadline:
+                return "timeout", None, model, page
+            _err(f"cdp connection dropped ({type(e).__name__}) — re-attaching to "
+                 f"{conversation_id} (attempt {drops}/{len(_RECONNECT_BACKOFF)})")
+            time.sleep(_RECONNECT_BACKOFF[drops - 1])
+            try:
+                page = find_conversation_page(conversation_id)  # SystemExit if truly gone
+            except drop_excs:
+                continue  # transport died mid-reattach; the next eval on the closed page
+                          # re-raises and consumes another attempt — still bounded
+            last_done = None                     # never trust pre-drop stability
+            continue
         st = json.loads(raw) if raw else {"state": "thinking"}
         model = st.get("model") or model
         if st["state"] == "blocker":
-            return "blocker", st.get("reason"), model
+            return "blocker", st.get("reason"), model, page
         if st["state"] == "done":
             text = st["text"]
             if last_done == text and not st.get("generating"):
-                return "done", text, model      # stable + stopped -> accept
+                return "done", text, model, page  # stable + stopped -> accept
             last_done = text                     # first sighting (or still changing) -> re-poll
             continue
         last_done = None                         # not done yet -> reset stability tracking
-    return "timeout", None, model
+    return "timeout", None, model, page
 
 
 def write_answer(rid: str, answer: str, out: str | None) -> Path:
@@ -624,8 +672,30 @@ def write_answer(rid: str, answer: str, out: str | None) -> Path:
 
 
 def _wait_cmd(rid: str, conv: str | None, out: str, timeout: int) -> str:
-    return (f"timeout {timeout + 40} python3 {SELF} wait "
+    # plain python3 — no GNU `timeout` prefix (absent on stock macOS); `wait` enforces
+    # its own deadline (internal poll deadline + SIGALRM backstop in cmd_wait)
+    return (f"python3 {SELF} wait "
             f"--rid {rid} --conversation {conv or 'unknown'} --out {out} --timeout {timeout}")
+
+
+def _await_cmd(rid: str, out: str, timeout: int) -> str:
+    # same portability rule as _wait_cmd; `await` carries its own deadline + backstop
+    return f"python3 {SELF} await --rid {rid} --out {out} --timeout {timeout}"
+
+
+def _hard_deadline(seconds: int) -> None:
+    """Portable replacement for the GNU `timeout` prefix the emitted commands used to
+    carry (coreutils is absent on stock macOS). If the process is somehow still alive
+    `seconds` from now, exit loudly with 4 — the documented no-answer-in-time code.
+    os._exit because a backstop must fire even if the interpreter is wedged."""
+    def _fire(_sig, _frm):
+        _err(f"hard deadline exceeded ({seconds}s) — exiting")
+        os._exit(4)
+    try:
+        signal.signal(signal.SIGALRM, _fire)
+        signal.alarm(max(1, int(seconds)))
+    except (ValueError, AttributeError):  # non-main thread / platform without SIGALRM
+        pass                              # the internal poll deadline still bounds the loop
 
 
 # --------------------------------------------------------------------------- #
@@ -703,6 +773,9 @@ def cmd_doctor(a) -> int:
         print("ok   egress daemon running (auto-mode enqueue/await path is live)")
     else:
         print("note egress daemon not running — for auto mode, USER runs: gptc watch")
+    if shutil.which("timeout") is None:
+        print("note GNU `timeout` not found (normal on stock macOS) — fine: emitted "
+              "wait/await commands no longer use it; deadlines are enforced in-process")
     print("note verify login by looking at the Chrome window (doctor can't read your session)")
     return 0 if ok else 2
 
@@ -741,7 +814,7 @@ def cmd_consult(a) -> int:
     page = open_new_chat()
     try:
         type_and_send(page, prompt)
-        state, answer, model = poll_answer(page, rid, a.timeout, a.poll)
+        state, answer, model, page = poll_answer(page, rid, a.timeout, a.poll)
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
@@ -787,9 +860,11 @@ def cmd_wait(a) -> int:
     if not a.conversation or a.conversation == "unknown":
         _err("wait requires a valid --conversation id (fail closed; no tab guessing)")
         return 2
+    _hard_deadline(a.timeout + 40)
     page = find_conversation_page(a.conversation)
     try:
-        state, answer, model = poll_answer(page, a.rid, a.timeout, a.poll)
+        state, answer, model, page = poll_answer(page, a.rid, a.timeout, a.poll,
+                                                 conversation_id=a.conversation)
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
@@ -938,8 +1013,7 @@ def cmd_enqueue(a) -> int:
     p = _ensure_spool()
     _atomic_write(os.path.join(p["pending"], f"{rid}.json"), json.dumps(job))
     res_out = {"rid": rid, "out": out, "queued": True, "daemon_running": _daemon_alive(),
-               "await_cmd": (f"timeout {a.timeout + 60} python3 {SELF} await "
-                             f"--rid {rid} --out {out} --timeout {a.timeout}")}
+               "await_cmd": _await_cmd(rid, out, a.timeout)}
     if not res_out["daemon_running"]:
         res_out["warning"] = "daemon not running — ask the USER to run: gptc watch"
     print(json.dumps(res_out))
@@ -949,6 +1023,7 @@ def cmd_enqueue(a) -> int:
 def cmd_await(a) -> int:
     """AGENT side, LOCAL only: poll the status file. Exit 0 done / 3 blocker / 4 no-answer
     / 2 setup (incl. daemon_not_running). No network."""
+    _hard_deadline(a.timeout + 60)
     sp = os.path.join(_spool()["status"], f"{a.rid}.json")
     deadline = time.time() + a.timeout
     while time.time() < deadline:
@@ -1060,7 +1135,8 @@ def _process_job(job: dict) -> None:
     try:
         type_and_send(page, prompt, expected_conversation=(cid if job["kind"] == "followup" else None))
         captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
-        state, ans, model = poll_answer(page, rid, timeout, 4.0)
+        state, ans, model, page = poll_answer(page, rid, timeout, 4.0,
+                                              conversation_id=captured)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
             st = {"out": str(out), "conversation_id": captured, "model": model}

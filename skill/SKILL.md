@@ -51,8 +51,8 @@ If the JSON shows `"daemon_running": false`, STOP and ask the USER to run `gptc 
 ```bash
 # 2. Await DETACHED — dispatch the printed await_cmd with the Bash tool and
 #    run_in_background: true, then go do other local work. Its exit wakes you.
-#    (the timeout prefix is already in await_cmd — keep it; never nohup & disown)
-timeout 960 python3 $SCRIPT await --rid <rid> --out <out> --timeout 900
+#    (await enforces its own deadline — no GNU timeout prefix; never nohup & disown)
+python3 $SCRIPT await --rid <rid> --out <out> --timeout 900
 ```
 
 ```
