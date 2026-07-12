@@ -426,3 +426,36 @@ def test_open_new_chat_closes_tab_on_configure_failure(monkeypatch):
         gptc.open_new_chat("work")
     assert ei.value.code == 3
     assert closed["target"] == 1 and closed["client"] == 1  # tab + socket cleaned up
+
+
+# --------------------------------------------------------------------------- #
+# daemon auto-start (gptc watch --detach) — starting the local process is allowed;
+# login is not (credentials), and it still needs Chrome up
+# --------------------------------------------------------------------------- #
+def test_watch_detach_noop_when_already_running(monkeypatch):
+    monkeypatch.setattr(gptc, "_daemon_alive", lambda: True)
+    assert gptc._start_watch_detached() == 0
+
+
+def test_watch_detach_fails_when_chrome_down(monkeypatch):
+    monkeypatch.setattr(gptc, "_daemon_alive", lambda: False)
+    monkeypatch.setattr(gptc, "_chrome_up", lambda: False)
+    assert gptc._start_watch_detached() == 2
+
+
+def test_watch_detach_spawns_and_waits(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(gptc, "_chrome_up", lambda: True)
+    monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)
+    seen = {"popen": 0}
+    monkeypatch.setattr(gptc.subprocess, "Popen",
+                        lambda *a, **k: seen.__setitem__("popen", seen["popen"] + 1))
+    alive = {"n": 0}
+
+    def _alive():  # False on the pre-check, True once the (stubbed) child is "up"
+        alive["n"] += 1
+        return alive["n"] > 1
+
+    monkeypatch.setattr(gptc, "_daemon_alive", _alive)
+    assert gptc._start_watch_detached() == 0 and seen["popen"] == 1

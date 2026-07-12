@@ -19,8 +19,10 @@ Design stance (differs from prior art on purpose):
     fails closed. A link-free follow-up requires an explicit --allow-nolink flag; in the
     interactive path that is a human, in the auto path it is an owner-authorized job field.
   * TWO SEND PATHS. Interactive: the send happens inside a command you run. Auto mode:
-    a USER-started daemon (`watch`) does the send off the agent so it works under Claude
-    Code's exfiltration classifier — and it re-derives the PROMPT + slugs itself (never
+    a daemon (`watch`, agent- or user-started; `--detach` for background) does the send off
+    the agent so it works under Claude Code's exfiltration classifier — the LOGIN stays the
+    human's job, but starting this local process does not. It re-derives the PROMPT + slugs
+    itself (never
     trusts agent-supplied rendered text) and re-validates every job at the point of send
     (strict schema, secret re-scan, gh public re-check, fail closed). This removes the
     platform's exfiltration net in exchange for that gate — a documented, opt-in trade-off,
@@ -1078,7 +1080,8 @@ def cmd_doctor(a) -> int:
     if _daemon_alive():
         print("ok   egress daemon running (auto-mode enqueue/await path is live)")
     else:
-        print("note egress daemon not running — for auto mode, USER runs: gptc watch")
+        print("note egress daemon not running — start it: gptc watch --detach "
+              "(agent may auto-start; login stays the user's job)")
     if shutil.which("timeout") is None:
         print("note GNU `timeout` not found (normal on stock macOS) — fine: emitted "
               "wait/await commands no longer use it; deadlines are enforced in-process")
@@ -1554,10 +1557,40 @@ def _recover_stranded(p: dict) -> None:
             pass
 
 
+def _start_watch_detached() -> int:
+    """Start the daemon as a detached, persistent background process and return immediately.
+    Idempotent (the flock in the child rejects duplicates; we also short-circuit if one is
+    already alive). Requires Chrome already launched + logged in — the LOGIN step stays the
+    human's job (Claude cannot enter credentials); starting this local process does not."""
+    if _daemon_alive():
+        print("gptc daemon already running")
+        return 0
+    if not _chrome_up():
+        _err("debug Chrome not running — run `gptc launch` and log into ChatGPT first")
+        return 2
+    _ensure_spool()
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    log = os.path.join(STATE_DIR, "watch.log")
+    with open(log, "a") as f:
+        subprocess.Popen([sys.executable, SELF, "watch"], start_new_session=True,
+                         stdout=f, stderr=f)
+    for _ in range(24):  # wait for the child's first heartbeat (up to ~6s)
+        if _daemon_alive():
+            print(f"gptc daemon started (detached; log {log})")
+            return 0
+        time.sleep(0.25)
+    _err(f"daemon did not come up — check {log} (Chrome login? another lock holder?)")
+    return 2
+
+
 def cmd_watch(a) -> int:
-    """USER-started daemon: the ONLY component that talks to chatgpt.com. Single-writer
-    (flock), re-derives + re-validates every job at send, and never resends a job that was
-    interrupted after it may have been sent. Start once, like the login. Ctrl-C stops."""
+    """The ONLY component that talks to chatgpt.com. Single-writer (flock), re-derives +
+    re-validates every job at send, never resends a job interrupted after it may have been
+    sent. `--detach` starts it as a persistent background process and returns; without it,
+    runs in the foreground (Ctrl-C stops). May be started by the user OR by the agent —
+    login stays the human's job, but starting this local process does not."""
+    if getattr(a, "detach", False):
+        return _start_watch_detached()
     p = _ensure_spool()
     if not _chrome_up():
         _err("debug Chrome not running — run `gptc launch` and log into ChatGPT first")
@@ -1745,8 +1778,11 @@ def main() -> int:
     aw.add_argument("--poll", type=float, default=3.0)
     aw.set_defaults(fn=cmd_await)
 
-    wt = sub.add_parser("watch", help="USER-started daemon: validate + send queued jobs")
+    wt = sub.add_parser("watch", help="daemon: validate + send queued jobs (--detach = background)")
     wt.add_argument("--poll", type=float, default=2.0)
+    wt.add_argument("--detach", action="store_true",
+                    help="start the daemon as a persistent background process and return "
+                         "(idempotent; needs Chrome already launched + logged in)")
     wt.set_defaults(fn=cmd_watch)
 
     sub.add_parser("queue", help="daemon liveness + spool counts").set_defaults(fn=cmd_queue)

@@ -179,7 +179,7 @@ commands, flags, exit codes, gotchas).
 ### Auto mode (unattended) — daemon path
 
 ```bash
-./bin/gptc watch                                  # USER starts the daemon once (like login)
+./bin/gptc watch --detach                          # start the daemon in the background (agent- or user-started)
 ./bin/gptc enqueue --task "..." --link owner/repo  # agent: local write, no network
 ./bin/gptc await   --rid <rid> --out answer.txt    # agent: local poll, no network; exit wakes caller
 ./bin/gptc queue                                   # daemon liveness + spool counts

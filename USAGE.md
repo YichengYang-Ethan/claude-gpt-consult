@@ -3,13 +3,15 @@
 Hand a self-contained job to your logged-in **ChatGPT** tab in the background, keep working,
 get woken with the answer to **verify**. ChatGPT *advises*; your local agent *executes + checks*.
 
-## 0. Once per machine boot (YOU do this — it's login)
+## 0. Once per machine boot
 ```bash
-gptc launch      # opens the dedicated debug Chrome — log into ChatGPT in it ONCE, leave open
-gptc watch       # starts the daemon (the only thing that talks to chatgpt.com). Leave running.
-gptc doctor      # green-checks deps / gh / Chrome / daemon
+gptc launch          # opens the dedicated debug Chrome — log into ChatGPT ONCE, by hand. (YOU)
+gptc watch --detach  # start the daemon in the background. (YOU, or Claude auto-starts it)
+gptc doctor          # green-checks deps / gh / Chrome / daemon
 ```
-`launch` + `watch` must be up for anything to run. After a reboot, re-run both.
+**Login is yours** (Claude can't enter credentials). **The daemon can auto-start** — if it's
+down, Claude runs `gptc watch --detach` itself (idempotent). After a reboot, re-do the login;
+the daemon comes back on demand.
 
 ## 1. From another terminal's Claude Code (the normal way)
 Just ask in plain language — the `gptc-consult` skill auto-activates and drives the daemon path

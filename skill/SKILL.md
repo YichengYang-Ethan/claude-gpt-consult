@@ -25,16 +25,20 @@ execute** locally.
   unreviewed local logs. Check what's actually in a link before it goes out.
 - The tool enforces this too (`enqueue` scans locally; the daemon re-scans + re-checks
   every repo is public before sending, fail closed). If it refuses, do not work around it.
-- One-time setup is the USER's job: they run `gptc launch` (log into ChatGPT once) and
-  `gptc watch` (start the daemon). **Never start the daemon or log in yourself.**
+- **Login is the USER's job — never enter credentials or attempt to log in yourself.** The
+  user runs `gptc launch` once and logs into ChatGPT by hand.
+- **The daemon you MAY start yourself.** If it isn't running, run `gptc watch --detach`
+  (persistent background process; idempotent — a flock rejects duplicates). It needs Chrome
+  already launched + logged in. Starting a local process is not entering credentials.
 
 ## Default path — the daemon (auto-mode-safe)
 
 **Why.** In auto mode a data-exfiltration classifier hard-denies any of *your* Bash calls
 that send data to an external host, so a direct send to chatgpt.com is blocked. The fix:
 you touch only LOCAL files. `enqueue` writes a job file; `await` polls a local answer
-file — neither touches the network. A USER-started daemon (`gptc watch`) does the actual
-send after re-validating the job is public-only and secret-free.
+file — neither touches the network. The daemon (`gptc watch`, agent- or user-started) does
+the actual send after re-validating the job is public-only (or `--private` and owner-authorized)
+and secret-free.
 
 ```bash
 # 1. Enqueue — a LOCAL write. Capture rid, out, and await_cmd from the JSON.
@@ -45,8 +49,10 @@ python3 $SCRIPT enqueue \
   --link  owner/repo#123
 ```
 
-If the JSON shows `"daemon_running": false`, STOP and ask the USER to run `gptc watch`
-(or `gptc launch` first if they haven't logged in). Do not start it yourself.
+If the JSON shows `"daemon_running": false`, start it yourself: `gptc watch --detach`, then
+re-check and proceed. If it can't come up because Chrome isn't logged in, THAT is the user's
+job — ask them to `gptc launch` and log in. (In a restricted auto-mode the platform's
+exfiltration classifier may still block starting it; if so, fall back to asking the user.)
 
 ```bash
 # 2. Await DETACHED — dispatch the printed await_cmd with the Bash tool and
@@ -67,7 +73,8 @@ clear it in the ChatGPT window, then re-enqueue) · `4` no answer (the model may
 been reasoning — re-enqueue with a larger `--timeout`) · **`5` salvaged PARTIAL answer**
 written to `<out>.partial` (the model answered but without the sentinel wrapper, or the
 deadline clipped it — treat as UNVERIFIED; re-enqueue if you need a clean, complete one) ·
-`2` setup error — usually `daemon_not_running` → ask the USER to run `gptc watch`.
+`2` setup error — usually `daemon_not_running` → start it with `gptc watch --detach` (or, if
+Chrome isn't logged in, ask the USER to `gptc launch` + log in).
 
 **Timeouts:** don't set them tight. Pro/Ultra reasoning legitimately runs **30–50 minutes**;
 the ceiling is mode-aware by default (`work`≈3000s, else 1800s, capped at 3600) and `await`
