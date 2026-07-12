@@ -143,6 +143,9 @@ pip install -r requirements.txt
 In Claude Code the **`gptc-consult` skill auto-activates** when a task fits — Claude reads
 its `SKILL.md` and orchestrates the arc for you. You can also drive the CLI by hand.
 
+**New here? See [`USAGE.md`](USAGE.md)** — a one-page cheat sheet (boot steps, the daily
+commands, flags, exit codes, gotchas).
+
 ## CLI
 
 ```bash
