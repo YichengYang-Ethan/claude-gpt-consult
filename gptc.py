@@ -508,6 +508,25 @@ def _extract_js(rid: str) -> str:
     })(""" + json.dumps(rid) + ")"
 
 
+def _salvage_js(rid: str) -> str:
+    """Best-effort rescue of an UNWRAPPED answer on timeout: return the raw text of the
+    assistant node carrying our rid's BEGIN (even if END/wrapping is missing), else the last
+    assistant node. Lets a long (Pro/Ultra) reasoning result be kept as <out>.partial instead
+    of lost when the model forgot the sentinels or the deadline clipped it."""
+    return """(function(rid){
+      var begin='BEGIN_RESPONSE:'+rid;
+      var nodes=document.querySelectorAll('[data-message-author-role="assistant"]');
+      var el=null;
+      for(var i=nodes.length-1;i>=0;i--){ if((nodes[i].textContent||'').indexOf(begin)!==-1){el=nodes[i];break;} }
+      if(!el && nodes.length) el=nodes[nodes.length-1];
+      if(!el) return JSON.stringify({found:false});
+      var model=null, mo=el.closest('[data-message-model-slug]');
+      if(mo) model=mo.getAttribute('data-message-model-slug');
+      var generating=!!document.querySelector('button[data-testid="stop-button"]');
+      return JSON.stringify({found:true,text:(el.textContent||'').trim(),model:model,generating:generating});
+    })(""" + json.dumps(rid) + ")"
+
+
 # --------------------------------------------------------------------------- #
 # session tier: mode (Chat/Work) + its pinned model. SINGLE source of truth.
 #   Chat -> the "Pro" effort tier, nested under the GPT-5.6 Sol submenu (fast, cheap)
@@ -904,6 +923,15 @@ def poll_answer(page: Page, rid: str, timeout: int, poll: float,
             last_done = text                     # first sighting (or still changing) -> re-poll
             continue
         last_done = None                         # not done yet -> reset stability tracking
+    # deadline hit — try to salvage any raw (unwrapped) answer so a long reasoning result
+    # isn't lost. Caller writes it to <out>.partial with a distinct code, NEVER the clean out.
+    try:
+        raw = page.eval(_salvage_js(rid))
+        s = json.loads(raw) if raw else {}
+        if s.get("found") and (s.get("text") or "").strip():
+            return "salvaged", s["text"], (s.get("model") or model), page
+    except Exception:
+        pass
     return "timeout", None, model, page
 
 
@@ -925,6 +953,28 @@ def _contain_out(out: str) -> str | None:
     base = os.path.realpath(ANSWER_DIR)
     cand = os.path.realpath(out if os.path.isabs(out) else os.path.join(base, out))
     return cand if cand == base or cand.startswith(base + os.sep) else None
+
+
+# Pro/Ultra reasoning tiers legitimately run for TENS of minutes (48m+ observed), so the
+# default ceiling is generous and mode-aware; the schema still caps at 3600. The timeout is
+# only a ceiling — a consult returns the instant the answer lands.
+_TIMEOUT_MAX = 3600
+
+
+def _default_timeout(mode: str | None) -> int:
+    return 3000 if mode == "work" else 1800
+
+
+def _resolve_timeout(a) -> int:
+    """Explicit --timeout wins; otherwise a mode-aware generous default, clamped to 1..3600."""
+    t = getattr(a, "timeout", None)
+    if t is None:
+        t = _default_timeout(getattr(a, "mode", None))
+    return max(1, min(int(t), _TIMEOUT_MAX))
+
+
+def _partial_path(out: str) -> str:
+    return out + ".partial"
 
 
 def _wait_cmd(rid: str, conv: str | None, out: str, timeout: int) -> str:
@@ -1071,19 +1121,28 @@ def _prep_consult(a):
 def cmd_consult(a) -> int:
     """Blocking: submit + wait in one go (interactive convenience)."""
     rid, prompt, res = _prep_consult(a)
+    timeout = _resolve_timeout(a)
     print(f"gate PASS — sending consult rid={rid} to ChatGPT ({PROJECT_URL}):")
     for i in res:
         print(f"  - {i['url']}")
-    print("  task:", a.title)
+    print(f"  task: {a.title}  (mode {a.mode or 'default'}, up to {timeout}s)")
     page = open_new_chat(a.mode)
     try:
         type_and_send(page, prompt)
-        state, answer, model, page = poll_answer(page, rid, a.timeout, a.poll)
+        state, answer, model, page = poll_answer(page, rid, timeout, a.poll)
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
+        if state == "salvaged":
+            pout = write_answer(rid, answer, _partial_path(a.out) if a.out
+                                else os.path.join(ANSWER_DIR, f"answer_{rid}.txt.partial"))
+            _err(f"UNWRAPPED answer salvaged (no sentinels within {timeout}s) -> {pout}  "
+                 "— treat as PARTIAL/unverified; the model may still have been reasoning")
+            print(answer)
+            return 5
         if state == "timeout":
-            _err(f"no wrapped answer within {a.timeout}s")
+            _err(f"no answer within {timeout}s — the model may still be reasoning "
+                 "(Pro/Ultra can take 30-50 min); raise --timeout or check the tab")
             return 4
         out = write_answer(rid, answer, a.out)
         warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
@@ -1113,14 +1172,14 @@ def cmd_submit(a) -> int:
         return 2
     out = a.out or os.path.join(ANSWER_DIR, f"answer_{rid}.txt")
     print(json.dumps({"rid": rid, "conversation_id": cid, "out": out,
-                      "wait_cmd": _wait_cmd(rid, cid, out, a.timeout)}))
+                      "wait_cmd": _wait_cmd(rid, cid, out, _resolve_timeout(a))}))
     return 0
 
 
 def cmd_wait(a) -> int:
     """Detached poller: re-attach to the conversation, poll to the wrapped answer,
-    write it, exit. Exit codes: 0 done / 3 blocker / 4 no-answer / 2 setup.
-    Requires a real conversation id — fails closed rather than guess a tab."""
+    write it, exit. Exit codes: 0 done / 3 blocker / 4 no-answer / 5 salvaged-partial /
+    2 setup. Requires a real conversation id — fails closed rather than guess a tab."""
     if not a.conversation or a.conversation == "unknown":
         _err("wait requires a valid --conversation id (fail closed; no tab guessing)")
         return 2
@@ -1132,8 +1191,14 @@ def cmd_wait(a) -> int:
         if state == "blocker":
             _err(f"blocker: {answer}")
             return 3
+        if state == "salvaged":
+            pout = write_answer(a.rid, answer, _partial_path(a.out) if a.out
+                                else os.path.join(ANSWER_DIR, f"answer_{a.rid}.txt.partial"))
+            _err(f"UNWRAPPED answer salvaged -> {pout}  (model {model or '?'}) — PARTIAL/unverified")
+            return 5
         if state == "timeout":
-            _err(f"no wrapped answer within {a.timeout}s")
+            _err(f"no answer within {a.timeout}s — the model may still be reasoning "
+                 "(Pro/Ultra can take 30-50 min); raise --timeout or check the tab")
             return 4
         out = write_answer(a.rid, answer, a.out)
         warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
@@ -1282,15 +1347,16 @@ def cmd_enqueue(a) -> int:
         if not ok:
             _err(res)
             return 2
+    timeout = _resolve_timeout(a)  # mode-aware generous default (Pro/Ultra run tens of minutes)
     job = {"rid": rid, "kind": a.kind, "task": a.task, "title": a.title,
            "role": a.role, "links": list(a.link), "allow_nolink": bool(a.allow_nolink),
            "allow_gist": bool(a.allow_gist), "conversation_id": a.conversation or None,
-           "timeout": a.timeout, "out": out, "mode": a.mode or None,
+           "timeout": timeout, "out": out, "mode": a.mode or None,
            "private": bool(a.private)}
     p = _ensure_spool()
     _atomic_write(os.path.join(p["pending"], f"{rid}.json"), json.dumps(job))
     res_out = {"rid": rid, "out": out, "queued": True, "daemon_running": _daemon_alive(),
-               "await_cmd": _await_cmd(rid, out, a.timeout)}
+               "await_cmd": _await_cmd(rid, out, timeout)}
     if not res_out["daemon_running"]:
         res_out["warning"] = "daemon not running — ask the USER to run: gptc watch"
     print(json.dumps(res_out))
@@ -1299,10 +1365,12 @@ def cmd_enqueue(a) -> int:
 
 def cmd_await(a) -> int:
     """AGENT side, LOCAL only: poll the status file. Exit 0 done / 3 blocker / 4 no-answer
-    / 2 setup (incl. daemon_not_running). No network."""
-    _hard_deadline(a.timeout + 60)
+    / 5 salvaged-partial / 2 setup (incl. daemon_not_running). No network. The wait window
+    outlives the job's own timeout (the daemon needs setup + poll time before it writes a
+    terminal status), so a slow Pro/Ultra job is not cut off early."""
+    _hard_deadline(a.timeout + 180)
     sp = os.path.join(_spool()["status"], f"{a.rid}.json")
-    deadline = time.time() + a.timeout
+    deadline = time.time() + a.timeout + 120
     while time.time() < deadline:
         if os.path.exists(sp):
             st = json.loads(Path(sp).read_text())
@@ -1313,11 +1381,16 @@ def cmd_await(a) -> int:
                 if st.get("model_warning"):
                     _err(f"MODEL WARNING: {st['model_warning']}")
                 return 0
+            if state == "salvaged":
+                _err(f"UNWRAPPED answer salvaged -> {st.get('out')}  (model "
+                     f"{st.get('model') or '?'}) — PARTIAL/unverified, re-enqueue if you need a clean one")
+                return 5
             if state == "blocker":
                 _err(f"blocker: {st.get('reason')}")
                 return 3
             if state == "no_answer":
-                _err("no wrapped answer")
+                _err("no answer (the model may still have been reasoning) — re-enqueue with a "
+                     "larger --timeout if this recurs")
                 return 4
             if state in ("refused", "error"):
                 _err(f"{state}: {st.get('reason')}")
@@ -1326,7 +1399,7 @@ def cmd_await(a) -> int:
             _err("daemon_not_running — ask the USER to run: gptc watch")
             return 2
         time.sleep(a.poll)
-    _err(f"await timed out after {a.timeout}s")
+    _err(f"await timed out after {a.timeout + 120}s")
     return 4
 
 
@@ -1441,6 +1514,10 @@ def _process_job(job: dict) -> None:
                 st["model_warning"] = warn
             st["state"] = "done" if captured else "done_unthreaded"
             _write_status(rid, st)
+        elif state == "salvaged":
+            pout = write_answer(rid, ans, _partial_path(safe_out))  # stays inside ANSWER_DIR
+            _write_status(rid, {"state": "salvaged", "out": str(pout),
+                                "conversation_id": captured, "model": model})
         elif state == "blocker":
             _write_status(rid, {"state": "blocker", "reason": ans})
         else:
@@ -1575,12 +1652,14 @@ def _add_consult_args(p):
                    help="public GitHub ref: owner/repo, owner/repo#PR, or a github.com URL")
     p.add_argument("--out", default="", help="answer file (default gptc_answers/answer_<rid>.txt)")
     p.add_argument("--rid", default="", help="fixed request id (default random)")
-    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--timeout", type=int, default=None,
+                   help="max seconds to wait — a ceiling; returns as soon as the answer lands. "
+                        "Default is mode-aware (work=3000, else 1800): Pro/Ultra run 30-50 min.")
     p.add_argument("--poll", type=float, default=4.0)
     p.add_argument("--allow-gist", action="store_true")
     p.add_argument("--close-tab", action="store_true")
     p.add_argument("--mode", choices=["chat", "work"], default="",
-                   help="tier for a fresh chat: chat=Pro (fast) / work=strongest (deep). "
+                   help="tier for a fresh chat: chat=Pro (fast) / work=Ultra (deep). "
                         "Default: leave the tab as-is.")
     p.add_argument("--private", action="store_true",
                    help="allow non-public repos (consulted via ChatGPT's own GitHub "
@@ -1615,7 +1694,7 @@ def main() -> int:
     w.add_argument("--rid", required=True)
     w.add_argument("--conversation", default="unknown")
     w.add_argument("--out", default="")
-    w.add_argument("--timeout", type=int, default=900)
+    w.add_argument("--timeout", type=int, default=1800)
     w.add_argument("--poll", type=float, default=4.0)
     w.add_argument("--close-tab", action="store_true")
     w.set_defaults(fn=cmd_wait)
@@ -1628,7 +1707,7 @@ def main() -> int:
                    help="permit a follow-up with no public link (you confirm no private data)")
     f.add_argument("--out", default="")
     f.add_argument("--rid", default="")
-    f.add_argument("--timeout", type=int, default=900)
+    f.add_argument("--timeout", type=int, default=1800)
     f.add_argument("--allow-gist", action="store_true")
     f.add_argument("--private", action="store_true",
                    help="allow non-public repos in this follow-up round")
@@ -1650,10 +1729,11 @@ def main() -> int:
     e.add_argument("--allow-nolink", action="store_true")
     e.add_argument("--out", default="")
     e.add_argument("--rid", default="")
-    e.add_argument("--timeout", type=int, default=900)
+    e.add_argument("--timeout", type=int, default=None,
+                   help="ceiling seconds; mode-aware default (work=3000, else 1800)")
     e.add_argument("--allow-gist", action="store_true")
     e.add_argument("--mode", choices=["chat", "work"], default="",
-                   help="tier for a fresh chat: chat=Pro / work=strongest (ignored on followup)")
+                   help="tier for a fresh chat: chat=Pro / work=Ultra (ignored on followup)")
     e.add_argument("--private", action="store_true",
                    help="allow non-public repos (re-validated by the daemon at send)")
     e.set_defaults(fn=cmd_enqueue)
@@ -1661,7 +1741,7 @@ def main() -> int:
     aw = sub.add_parser("await", help="agent side: poll the local answer status (no network)")
     aw.add_argument("--rid", required=True)
     aw.add_argument("--out", default="")
-    aw.add_argument("--timeout", type=int, default=900)
+    aw.add_argument("--timeout", type=int, default=1800)
     aw.add_argument("--poll", type=float, default=3.0)
     aw.set_defaults(fn=cmd_await)
 

@@ -191,9 +191,16 @@ most UI-fragile part of the original and is intentionally left out).
 `owner/repo` · `owner/repo#123` (PR) · any `https://github.com/...` URL · `raw.githubusercontent.com/...`.
 Non-GitHub links and gists are refused (gists: `--allow-gist` to override).
 
-### `wait` exit codes
-`0` answer written · `3` blocker (login/captcha/rate-limit) · `4` no wrapped answer before
-timeout · `2` setup error (e.g. Chrome not running).
+### `wait` / `await` exit codes
+`0` answer written · `3` blocker (login/captcha/rate-limit) · `4` no answer before timeout
+(the model may still be reasoning — raise `--timeout`) · `5` salvaged **partial** answer to
+`<out>.partial` (unwrapped / clipped — treat as unverified) · `2` setup error (e.g. Chrome
+not running).
+
+**Timeouts are ceilings, not fixed waits** — a consult returns the instant the answer lands.
+Pro/Ultra reasoning legitimately runs **30–50 min** (48m+ observed), so the default is
+mode-aware and generous (`--mode work`≈3000s, else 1800s, capped at 3600) and `await` outlives
+the job window. Don't read a long wait as a hang.
 
 ## Configuration (env; nothing here is a secret)
 
