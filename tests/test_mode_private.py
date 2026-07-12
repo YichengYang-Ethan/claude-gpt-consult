@@ -143,9 +143,11 @@ class _LeafPage:
 
 
 class _WorkPage:
-    """Page for _set_work_ultra: open Effort submenu, pick Ultra, confirm the row."""
-    def __init__(self, submenu="opened", radios=6, pick="picked", row="Effort Ultra"):
-        self.submenu, self.radios, self.pick, self.row = submenu, radios, pick, row
+    """Page for _set_work_ultra: open Effort submenu, pick Ultra, confirm row + Sol pill."""
+    def __init__(self, submenu="opened", radios=6, pick="picked", row="Effort Ultra",
+                 pill="5.6 Sol Ultra"):
+        self.submenu, self.radios, self.pick, self.row, self.pill = \
+            submenu, radios, pick, row, pill
 
     def eval(self, expr):
         if "PointerEvent" in expr and "Effort" in expr:     # open effort submenu
@@ -154,6 +156,10 @@ class _WorkPage:
             return self.pick
         if "menuitemradio" in expr:                         # count
             return self.radios
+        if "__composer-pill" in expr:                       # committed pill label (family+effort)
+            return self.pill
+        if "Escape" in expr:
+            return None
         if "Effort" in expr:                                # effort row label read
             return self.row
         return None
@@ -192,6 +198,11 @@ def test_set_work_ultra_fails_when_tier_absent(monkeypatch):
 def test_set_work_ultra_fails_when_not_confirmed(monkeypatch):
     monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)  # pick claims ok, row didn't update
     assert gptc._set_work_ultra(_WorkPage(row="Effort Extra High")) is False
+
+
+def test_set_work_ultra_fails_when_family_not_sol(monkeypatch):
+    monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)  # effort=Ultra but model is not Sol
+    assert gptc._set_work_ultra(_WorkPage(pill="GPT-5.5 Ultra")) is False
 
 
 def _patch_helpers(monkeypatch, **overrides):
@@ -267,3 +278,74 @@ def test_poll_answer_calls_heartbeat_each_tick(monkeypatch):
         heartbeat_cb=lambda: beats.__setitem__("n", beats["n"] + 1))
     assert state == "done" and text == "BODY"
     assert beats["n"] >= 1  # heartbeat kept fresh while waiting
+
+
+def test_touch_heartbeat_writes_fresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    gptc._ensure_spool()
+    gptc._touch_heartbeat()
+    assert gptc._daemon_alive() is True
+
+
+# --------------------------------------------------------------------------- #
+# #0: interactive paths must validate --rid (it lands in the OUTBOUND prompt but is
+# not part of the text the gate secret-scans)
+# --------------------------------------------------------------------------- #
+def test_prep_consult_rejects_nonhex_rid():
+    a = types.SimpleNamespace(rid="deadbeef\nsk-ant-api03-" + "A" * 20, role="", title="t",
+                              task="review", link=["owner/repo"], allow_gist=False, private=False)
+    with pytest.raises(SystemExit) as ei:
+        gptc._prep_consult(a)
+    assert ei.value.code == 2
+
+
+def test_followup_rejects_nonhex_rid():
+    a = types.SimpleNamespace(rid="x\nsk-ant-api03-" + "A" * 20, conversation="a" * 20,
+                              task="r", link=["a/b"], allow_nolink=False, allow_gist=False,
+                              private=False, out="", timeout=10)
+    assert gptc.cmd_followup(a) == 2
+
+
+# --------------------------------------------------------------------------- #
+# #3: dot-segment / percent-encoded traversal slugs are refused (they'd normalize to a
+# different `gh api` endpoint and pass the --private existence check)
+# --------------------------------------------------------------------------- #
+def test_slug_traversal_refused():
+    for bad in ["../rate_limit", "owner/..", "./x", "..%2f", "a/."]:
+        ok, _ = gptc.resolve_link(bad)
+        assert not ok, bad
+
+
+def test_slug_normal_still_ok():
+    for good in ["python/cpython", "my-org/my.repo_2", "a/b"]:
+        ok, info = gptc.resolve_link(good)
+        assert ok and info["kind"] == "repo", good
+
+
+def test_slug_ok_unit():
+    assert gptc._slug_ok("owner/repo") and not gptc._slug_ok("../repo") \
+        and not gptc._slug_ok("owner/..") and not gptc._slug_ok("a/%2e")
+
+
+# --------------------------------------------------------------------------- #
+# #5: a fail-closed tier error closes the tab instead of leaking it
+# --------------------------------------------------------------------------- #
+def test_open_new_chat_closes_tab_on_configure_failure(monkeypatch):
+    closed = {"target": 0, "client": 0}
+
+    class _P:
+        def close_target(self):
+            closed["target"] += 1
+
+        def close(self):
+            closed["client"] += 1
+
+    monkeypatch.setattr(gptc, "_chrome_up", lambda: True)
+    monkeypatch.setattr(gptc, "open_tab", lambda url: _P())
+    monkeypatch.setattr(gptc, "_wait_composer", lambda page: True)
+    monkeypatch.setattr(gptc, "configure_session",
+                        lambda page, mode: (_ for _ in ()).throw(SystemExit(3)))
+    with pytest.raises(SystemExit) as ei:
+        gptc.open_new_chat("work")
+    assert ei.value.code == 3
+    assert closed["target"] == 1 and closed["client"] == 1  # tab + socket cleaned up

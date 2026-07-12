@@ -45,6 +45,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -106,6 +107,20 @@ _COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 _ALLOWED_CHAT_HOSTS = {"chatgpt.com", "chat.openai.com"}
 
 
+def _slug_ok(slug: str) -> bool:
+    """owner/repo where each component is a plausible GitHub name. Rejects '.'/'..'/dot-only
+    and percent-encoded components so a slug like '../rate_limit' (or '%2e%2e/x') can't ride
+    through resolve_link and then normalize to a DIFFERENT `gh api` endpoint — which would let
+    a bogus repo pass the --private existence check (gate_public's _gh_ok)."""
+    parts = slug.split("/")
+    if len(parts) != 2:
+        return False
+    for p in parts:
+        if not p or ".." in p or "%" in p or set(p) <= {"."} or not re.search(r"[A-Za-z0-9]", p):
+            return False
+    return True
+
+
 def scan_secrets(text: str) -> str | None:
     for name, rx in SECRET_RES:
         if rx.search(text):
@@ -122,8 +137,12 @@ def resolve_link(link: str, allow_gist: bool = False):
     m = re.fullmatch(r"([\w.\-]+/[\w.\-]+)#(\d+)", link)
     if m:
         slug, pr = m.group(1), m.group(2)
+        if not _slug_ok(slug):
+            return False, f"invalid owner/repo (dot-segment or encoded traversal): {link}"
         return True, {"slug": slug, "url": f"https://github.com/{slug}/pull/{pr}", "kind": "pr", "ref": pr}
     if re.fullmatch(r"[\w.\-]+/[\w.\-]+", link):
+        if not _slug_ok(link):
+            return False, f"invalid owner/repo (dot-segment or encoded traversal): {link}"
         return True, {"slug": link, "url": f"https://github.com/{link}", "kind": "repo"}
     if link.startswith(("http://", "https://")):
         u = urllib.parse.urlparse(link)
@@ -140,6 +159,8 @@ def resolve_link(link: str, allow_gist: bool = False):
             if len(parts) < 2:
                 return False, f"GitHub link missing owner/repo: {link}"
             slug = f"{parts[0]}/{parts[1]}".removesuffix(".git")
+            if not _slug_ok(slug):
+                return False, f"invalid owner/repo (dot-segment or encoded traversal): {link}"
             # canonicalize to an allowlisted shape — an arbitrary path tail (e.g.
             # /blob/main/<BASE64>) is refused so a link can't smuggle data past the gate
             if len(parts) == 2:
@@ -663,8 +684,10 @@ def _set_chat_pro(page: Page) -> bool:
 
 
 def _set_work_ultra(page: Page) -> bool:
-    """Work: open the Advanced Effort submenu, pick the strongest tier (Ultra), confirm the
-    Effort row updated. Ultra is above the simple slider's cap, so we drive the submenu."""
+    """Work: open the Advanced Effort submenu, pick the strongest tier (Ultra), then confirm
+    the committed composer pill shows BOTH the Sol family AND Ultra. Ultra is above the simple
+    slider's cap, so we drive the submenu; and we verify the family (not just the effort) so a
+    non-Sol Work model can't pass as 'Sol Ultra'."""
     if page.eval(_OPEN_EFFORT_SUBMENU_JS) != "opened":
         return False
     if not _eval_until(page, _MENUITEMRADIO_COUNT_JS, lambda v: isinstance(v, int) and v > 0):
@@ -673,7 +696,13 @@ def _set_work_ultra(page: Page) -> bool:
         return False
     row = _eval_until(page, _EFFORT_ROW_JS,
                       lambda v: isinstance(v, str) and _WORK_EFFORT in v, tries=6)
-    return isinstance(row, str) and _WORK_EFFORT in row
+    if not (isinstance(row, str) and _WORK_EFFORT in row):  # _eval_until returns the last value
+        return False
+    page.eval(_MENU_ESCAPE_JS)  # close so the composer pill shows the committed family+effort
+    time.sleep(0.3)
+    lab = _eval_until(page, _MODEL_PILL_LABEL_JS,
+                      lambda v: isinstance(v, str) and "Sol" in v and _WORK_EFFORT in v, tries=6)
+    return isinstance(lab, str) and "Sol" in lab and _WORK_EFFORT in lab
 
 
 def configure_session(page: Page, mode: str | None) -> None:
@@ -706,15 +735,26 @@ def configure_session(page: Page, mode: str | None) -> None:
 def open_new_chat(mode: str | None = None) -> Page:
     _die_if_no_chrome()
     page = open_tab(PROJECT_URL)
-    st = _wait_composer(page)
-    if st == "login":
-        _err("login wall — log into ChatGPT in the debug Chrome window, then retry")
-        raise SystemExit(3)
-    if not st:
-        _err("composer never appeared (login? UI drift?)")
-        raise SystemExit(3)
-    configure_session(page, mode)
-    return page
+    # Once the tab exists, ANY failure below (login wall, UI drift, a fail-closed tier
+    # selection in configure_session) must close it — otherwise every such error leaks a
+    # Chrome tab + CDP socket, and tier failures are common under UI drift.
+    try:
+        st = _wait_composer(page)
+        if st == "login":
+            _err("login wall — log into ChatGPT in the debug Chrome window, then retry")
+            raise SystemExit(3)
+        if not st:
+            _err("composer never appeared (login? UI drift?)")
+            raise SystemExit(3)
+        configure_session(page, mode)
+        return page
+    except BaseException:
+        try:
+            page.close_target()
+            page.close()
+        except Exception:
+            pass
+        raise
 
 
 def find_conversation_page(conv_id: str) -> Page:
@@ -996,6 +1036,11 @@ def cmd_gate(a) -> int:
 def _prep_consult(a):
     """Shared gate+render for submit/consult. Returns (rid, prompt, resolved) or raises."""
     rid = a.rid or secrets.token_hex(4)
+    if not _RID_RE.fullmatch(rid):
+        # rid is interpolated into the OUTBOUND prompt (BEGIN_RESPONSE:<rid>) but is not part
+        # of the text the gate secret-scans; a non-hex rid could smuggle a secret past it.
+        _err("--rid must be 8-64 lowercase hex characters")
+        raise SystemExit(2)
     role = a.role or "You are a rigorous senior engineer and reviewer."
     preview = f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link)
     ok, res = gate(preview, a.link, allow_gist=a.allow_gist,
@@ -1089,6 +1134,9 @@ def cmd_followup(a) -> int:
     """Send another round into an existing conversation. Always secret-scanned;
     requires a public --link unless --allow-nolink is passed explicitly."""
     rid = a.rid or secrets.token_hex(4)
+    if not _RID_RE.fullmatch(rid):  # rid goes into the outbound prompt but isn't gate-scanned
+        _err("--rid must be 8-64 lowercase hex characters")
+        return 2
     hit = scan_secrets(a.task + "\n" + "\n".join(a.link))
     if hit:
         _err(f"refusing: follow-up contains secret-like content ({hit})")
@@ -1170,6 +1218,14 @@ def _atomic_write(path: str, data: str) -> None:
     tmp = f"{path}.tmp"
     Path(tmp).write_text(data)
     os.rename(tmp, path)
+
+
+def _touch_heartbeat() -> None:
+    """Refresh the daemon liveness heartbeat. Fail-safe: bookkeeping must never break a job."""
+    try:
+        _atomic_write(_spool()["heartbeat"], str(int(time.time())))
+    except OSError:
+        pass
 
 
 def _write_status(rid: str, st: dict) -> None:
@@ -1350,17 +1406,11 @@ def _process_job(job: dict) -> None:
         _write_status(rid, {"state": "error", "reason": f"setup (exit {e.code})"})
         return
 
-    def _hb():                                    # keep the liveness heartbeat fresh during
-        try:                                      # a long (Pro/Ultra) job so `await` on the
-            _atomic_write(_spool()["heartbeat"], str(int(time.time())))  # agent side doesn't
-        except OSError:                           # mistake alive-but-slow for daemon_not_running
-            pass
-
     try:
         type_and_send(page, prompt, expected_conversation=(cid if job["kind"] == "followup" else None))
         captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
         state, ans, model, page = poll_answer(page, rid, timeout, 4.0,
-                                              conversation_id=captured, heartbeat_cb=_hb)
+                                              conversation_id=captured, heartbeat_cb=_touch_heartbeat)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
             st = {"out": str(out), "conversation_id": captured, "model": model}
@@ -1421,10 +1471,23 @@ def cmd_watch(a) -> int:
         os.close(lock_fd)
         return 2
     _recover_stranded(p)
+    # Heartbeat on a DEDICATED thread for the daemon's whole lifetime — the per-poll write
+    # below and the poll_answer callback only cover parts of a job, but a job's setup phase
+    # (gh gate calls + tab-driving configure_session + send) can itself exceed the 30s TTL,
+    # which would make a waiting `await` mistakenly declare the live daemon dead.
+    _hb_stop = threading.Event()
+
+    def _heartbeat_loop():
+        _touch_heartbeat()
+        while not _hb_stop.wait(10):
+            _touch_heartbeat()
+
+    _hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    _hb_thread.start()
     print(f"gptc daemon watching {SPOOL_DIR} — Ctrl-C to stop")
     try:
         while True:
-            _atomic_write(p["heartbeat"], str(int(time.time())))
+            _touch_heartbeat()
             try:
                 names = sorted(n for n in os.listdir(p["pending"]) if n.endswith(".json"))
             except FileNotFoundError:
@@ -1456,6 +1519,7 @@ def cmd_watch(a) -> int:
         print("\ndaemon stopped")
         return 0
     finally:
+        _hb_stop.set()
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
