@@ -48,7 +48,7 @@ def test_private_gate_still_secret_scans(monkeypatch):
 def _raw(**kw):
     base = dict(rid="deadbeef", kind="consult", task="clean", title="t", role="r",
                 links=["a/b"], allow_nolink=False, allow_gist=False,
-                conversation_id=None, timeout=10, out="/tmp/x.txt", mode=None, private=False)
+                conversation_id=None, timeout=10, out="answer.txt", mode=None, private=False)
     base.update(kw)
     return base
 
@@ -86,6 +86,7 @@ def test_daemon_private_job_passes_gate_and_sends(tmp_path, monkeypatch):
     """A private=True job with a private (but existing) repo clears the gate and reaches
     send — the deliberate opt-in. Send path is stubbed (no Chrome in a unit test)."""
     monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path))         # so out stays contained
     monkeypatch.setattr(gptc, "_repo_is_public", lambda s: False)  # it's private
     monkeypatch.setattr(gptc, "_gh_ok", lambda p: True)            # but it exists
     sent = {}

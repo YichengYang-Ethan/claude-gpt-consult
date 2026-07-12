@@ -63,9 +63,11 @@ def test_enqueue_followup_needs_link_or_flag(tmp_path, monkeypatch):
 
 
 def _raw(**kw):
+    # out is a RELATIVE name so it resolves inside ANSWER_DIR (the daemon contains `out`);
+    # tests that exercise the containment guard pass an escaping absolute path explicitly.
     base = dict(rid="deadbeef", kind="consult", task="clean", title="t", role="r",
                 links=["a/b"], allow_nolink=False, allow_gist=False,
-                conversation_id=None, timeout=10, out="/tmp/x.txt",
+                conversation_id=None, timeout=10, out="answer.txt",
                 mode=None, private=False)
     base.update(kw)
     return base
@@ -73,21 +75,42 @@ def _raw(**kw):
 
 def test_daemon_refuses_private_repo(tmp_path, monkeypatch):
     monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path))
     monkeypatch.setattr(gptc, "_repo_is_public", lambda s: False)
     gptc._ensure_spool()
-    gptc._process_job(_raw(rid="cccccccc", out=str(tmp_path / "ans.txt")))
+    gptc._process_job(_raw(rid="cccccccc"))
     st = json.loads((tmp_path / "spool" / "status" / "cccccccc.json").read_text())
     assert st["state"] == "refused" and "public" in st["reason"]
 
 
 def test_daemon_rescans_raw_inputs_for_secret(tmp_path, monkeypatch):
     monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path))
     monkeypatch.setattr(gptc, "_repo_is_public", lambda s: True)
     gptc._ensure_spool()
-    gptc._process_job(_raw(rid="dddddddd", task="leak sk-ant-api03-" + "A" * 20,
-                           out=str(tmp_path / "a.txt")))
+    gptc._process_job(_raw(rid="dddddddd", task="leak sk-ant-api03-" + "A" * 20))
     st = json.loads((tmp_path / "spool" / "status" / "dddddddd.json").read_text())
     assert st["state"] == "refused"
+
+
+def test_daemon_refuses_out_escaping_answer_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path / "answers"))
+    monkeypatch.setattr(gptc, "_repo_is_public", lambda s: True)
+    gptc._ensure_spool()
+    # an agent-supplied out that would write the answer OUTSIDE the answer dir is refused
+    gptc._process_job(_raw(rid="eeee0001", out=str(tmp_path / "outside" / "authorized_keys")))
+    st = json.loads((tmp_path / "spool" / "status" / "eeee0001.json").read_text())
+    assert st["state"] == "refused" and "escapes" in st["reason"]
+
+
+def test_contain_out_unit(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path / "answers"))
+    assert gptc._contain_out("a.txt") is not None
+    assert gptc._contain_out(str(tmp_path / "answers" / "x.txt")) is not None
+    assert gptc._contain_out("../evil.txt") is None
+    assert gptc._contain_out("/etc/passwd") is None
+    assert gptc._contain_out(str(tmp_path / "outside.txt")) is None
 
 
 def test_daemon_refuses_forged_kind(tmp_path, monkeypatch):

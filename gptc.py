@@ -14,19 +14,23 @@ The workflow (a thread, not a one-shot):
     status  -> one-shot state of a conversation
 
 Design stance (differs from prior art on purpose):
-  * PUBLIC-CODE-ONLY egress. Every consult carries >=1 public GitHub link,
+  * PUBLIC-CODE-ONLY egress by default. Every consult carries >=1 public GitHub link,
     gh-confirmed public. The whole rendered prompt is scanned for secret shapes and
-    fails closed. A link-free follow-up requires an explicit --allow-nolink flag
-    (user-controlled), not a spoofable in-prompt substring.
+    fails closed. A link-free follow-up requires an explicit --allow-nolink flag; in the
+    interactive path that is a human, in the auto path it is an owner-authorized job field.
   * TWO SEND PATHS. Interactive: the send happens inside a command you run. Auto mode:
     a USER-started daemon (`watch`) does the send off the agent so it works under Claude
-    Code's exfiltration classifier — and it re-derives + re-validates every job at the
-    point of send (strict schema, secret re-scan, gh public re-check, fail closed). This
-    removes the platform's exfiltration net in exchange for that gate — a documented,
-    opt-in trade-off, not a hidden bypass. Pure-stdlib state cannot be made tamper-proof
-    against an adversarial agent running as the SAME OS user; strong isolation needs the
-    daemon under a separate account. The daemon re-validates precisely so it never trusts
-    agent-supplied state as authorization.
+    Code's exfiltration classifier — and it re-derives the PROMPT + slugs itself (never
+    trusts agent-supplied rendered text) and re-validates every job at the point of send
+    (strict schema, secret re-scan, gh public re-check, fail closed). This removes the
+    platform's exfiltration net in exchange for that gate — a documented, opt-in trade-off,
+    not a hidden bypass. Honest scope of the trust: the daemon does NOT trust agent-supplied
+    *content*, but it DOES honor a few owner-authorized agent-supplied *flags* — `private`
+    (allow non-public repos) and `allow_nolink` (waive the link anchor on a follow-up) — by
+    the owner's deliberate choice to give the agent that latitude. Pure-stdlib state cannot
+    be made tamper-proof against an agent running as the SAME OS user; strong isolation
+    needs the daemon under a separate account. The `out` path IS contained to ANSWER_DIR so
+    the daemon can't be steered into writing answer content to an arbitrary file.
   * Ordinary automation of your OWN logged-in session. The tool never handles your
     password; you log into a dedicated Chrome profile once, by hand.
 
@@ -910,6 +914,19 @@ def write_answer(rid: str, answer: str, out: str | None) -> Path:
     return p
 
 
+def _contain_out(out: str) -> str | None:
+    """Return an absolute answer path guaranteed to sit inside ANSWER_DIR, else None.
+    Used ONLY by the daemon: `out` is agent-supplied, and the daemon (a higher-trust domain
+    under separate-account isolation, and a write-anywhere footgun even same-user) must never
+    be steered into writing answer content to an arbitrary path such as ~/.ssh/authorized_keys.
+    This does NOT reduce what Claude/GPT can do — the agent has its own filesystem access; it
+    only removes the daemon as a write gadget for a prompt-injected job. The interactive --out
+    stays unconstrained (a human chose it)."""
+    base = os.path.realpath(ANSWER_DIR)
+    cand = os.path.realpath(out if os.path.isabs(out) else os.path.join(base, out))
+    return cand if cand == base or cand.startswith(base + os.sep) else None
+
+
 def _wait_cmd(rid: str, conv: str | None, out: str, timeout: int) -> str:
     # plain python3 — no GNU `timeout` prefix (absent on stock macOS); `wait` enforces
     # its own deadline (internal poll deadline + SIGALRM backstop in cmd_wait)
@@ -1349,6 +1366,11 @@ def _process_job(job: dict) -> None:
     if not (isinstance(job["out"], str) and job["out"]):
         _write_status(rid, {"state": "refused", "reason": "out must be a non-empty string"})
         return
+    safe_out = _contain_out(job["out"])  # agent-supplied path must stay inside ANSWER_DIR
+    if safe_out is None:
+        _write_status(rid, {"state": "refused",
+                            "reason": f"out escapes the answer dir ({ANSWER_DIR})"})
+        return
     if job["mode"] is not None and job["mode"] not in ("chat", "work"):
         _write_status(rid, {"state": "refused", "reason": "mode must be null|chat|work"})
         return
@@ -1412,7 +1434,7 @@ def _process_job(job: dict) -> None:
         state, ans, model, page = poll_answer(page, rid, timeout, 4.0,
                                               conversation_id=captured, heartbeat_cb=_touch_heartbeat)
         if state == "done":
-            out = write_answer(rid, ans, job["out"])
+            out = write_answer(rid, ans, safe_out)
             st = {"out": str(out), "conversation_id": captured, "model": model}
             warn = model_downgrade_warning(model, os.environ.get("GPTC_EXPECT_MODEL", ""))
             if warn:

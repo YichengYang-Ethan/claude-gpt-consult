@@ -115,6 +115,14 @@ agent, so Claude Code's exfiltration net no longer sees it — the daemon's re-v
 gate is what protects you instead. That gate is public-repo-only + whole-prompt secret
 scan, fail closed; it is deliberately narrow, and you should keep it that way.
 
+**Honest scope of the daemon's trust.** It never trusts agent-supplied *content* (it
+re-derives the prompt and re-scans/re-checks every job), and it contains the answer `out`
+path to the answer dir so it can't be used as a write-anywhere gadget. It **does** honor two
+owner-authorized agent-supplied *flags* — `--private` (non-public repos) and `--allow-nolink`
+(waive the link anchor on a follow-up) — by your deliberate choice to give the agent that
+latitude. If you don't want the agent to self-authorize those, don't pass them / patch the
+daemon to require an out-of-band allowlist.
+
 ## Requirements
 
 - **Python 3.8+** and `websocket-client` (`pip install websocket-client`)
