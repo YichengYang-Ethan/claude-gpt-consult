@@ -11,7 +11,8 @@ import gptc  # noqa: E402
 
 def _args(**kw):
     base = dict(task="", title="c", role="", link=[], kind="consult", conversation="",
-                allow_nolink=False, out="", rid="aaaaaaaa", timeout=10, allow_gist=False)
+                allow_nolink=False, out="", rid="aaaaaaaa", timeout=10, allow_gist=False,
+                mode="", private=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -64,7 +65,8 @@ def test_enqueue_followup_needs_link_or_flag(tmp_path, monkeypatch):
 def _raw(**kw):
     base = dict(rid="deadbeef", kind="consult", task="clean", title="t", role="r",
                 links=["a/b"], allow_nolink=False, allow_gist=False,
-                conversation_id=None, timeout=10, out="/tmp/x.txt")
+                conversation_id=None, timeout=10, out="/tmp/x.txt",
+                mode=None, private=False)
     base.update(kw)
     return base
 

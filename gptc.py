@@ -203,16 +203,25 @@ def _gh_ok(api_path: str) -> bool:
     return r.returncode == 0
 
 
-def gate_public(resolved: list[dict]):
+def gate_public(resolved: list[dict], allow_private: bool = False):
     """NETWORK gate: gh-confirm every repo is public AND that the referenced object
     actually EXISTS. The latter closes covert channels — a /commit/<40-hex> or
     /pull/<digits> whose value is attacker-chosen data (not a real object) is refused,
     as are gists (visibility/existence unprovable). Fails closed. Runs in the daemon
-    or in submit/consult, never on the classifier-guarded agent side."""
+    or in submit/consult, never on the classifier-guarded agent side.
+
+    allow_private (opt-in, per job): drop the PUBLIC assertion but still gh-confirm the
+    repo EXISTS (an authenticated `gh` can see the owner's private repos), so a bogus
+    slug can't ride through as a covert channel. This is the deliberate posture relaxation
+    for consulting on your OWN private code via ChatGPT's GitHub connector — the secret
+    scan still runs, and the connector-fetched CONTENT is inherently outside this gate."""
     for info in resolved:
         if info["slug"] is None:  # gist — cannot prove public or that the object exists
             return False, "refusing: gists are not allowed (visibility/existence unprovable)"
-        if not _repo_is_public(info["slug"]):
+        if allow_private:
+            if not _gh_ok(f"repos/{info['slug']}"):
+                return False, f"refusing: repo not found even with --private: {info['slug']}"
+        elif not _repo_is_public(info["slug"]):
             return False, f"refusing: repo not gh-confirmed public: {info['slug']}"
         kind, ref = info.get("kind"), info.get("ref")
         if kind == "pr" and not _gh_ok(f"repos/{info['slug']}/pulls/{ref}"):
@@ -222,12 +231,13 @@ def gate_public(resolved: list[dict]):
     return True, resolved
 
 
-def gate(prompt_text: str, links: list[str], allow_gist: bool = False):
+def gate(prompt_text: str, links: list[str], allow_gist: bool = False,
+         allow_private: bool = False):
     """Full gate = local + public. Used by the interactive submit/consult path."""
     ok, res = gate_local(prompt_text, links, allow_gist)
     if not ok:
         return False, res
-    return gate_public(res)
+    return gate_public(res, allow_private=allow_private)
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +484,92 @@ def _extract_js(rid: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# session tier: mode (Chat/Work) + its pinned model. SINGLE source of truth.
+#   Chat -> the "Pro" effort tier, nested under the GPT-5.6 Sol submenu (fast, cheap)
+#   Work -> the "Ultra" effort tier, in the Advanced view's Effort submenu (strongest).
+#           NB: Work's simple power slider caps at "Extra High"; Max/Ultra live only in
+#           the Advanced -> Effort submenu, so we drive that, not the slider.
+# These selectors are LIVE-CDP and have no stability contract; every actuation is
+# verified and fails LOUD/CLOSED (SystemExit 3) rather than silently answer on a
+# weaker tier than requested — consistent with the tool's model-transparency stance.
+# --------------------------------------------------------------------------- #
+_MODE_LABEL = {"chat": "Chat", "work": "Work"}
+_CHAT_MODEL_ITEM = "Pro"      # Chat: the effort tier picked under the GPT-5.6 Sol submenu
+_WORK_EFFORT = "Ultra"        # Work: the strongest effort tier (Advanced -> Effort submenu)
+
+
+def _select_mode_js(want: str) -> str:
+    """Click the Chat/Work segmented radio whose text is exactly `want`."""
+    return ("(function(w){var rs=document.querySelectorAll('button[role=\"radio\"]');"
+            "for(var i=0;i<rs.length;i++){if((rs[i].textContent||'').trim()===w){rs[i].click();return 'clicked';}}"
+            "return 'no-radio';})(" + json.dumps(want) + ")")
+
+
+_READ_MODE_JS = ("(function(){var rs=document.querySelectorAll('button[role=\"radio\"]');"
+                 "for(var i=0;i<rs.length;i++){if(rs[i].getAttribute('data-state')==='on')"
+                 "return (rs[i].textContent||'').trim();}return null;})()")
+
+# open the composer model pill — it is a Radix menu trigger, so a plain .click() does
+# not open it; dispatch a real pointerdown/up sequence at its center.
+_OPEN_MODEL_PILL_JS = (
+    "(function(){var form=document.querySelector('form');"
+    "var pill=form&&form.querySelector('button.__composer-pill[aria-haspopup=\"menu\"]');"
+    "if(!pill)return 'no-pill';var r=pill.getBoundingClientRect();var x=r.x+r.width/2,y=r.y+r.height/2;"
+    "function ev(t){return new PointerEvent(t,{bubbles:true,cancelable:true,clientX:x,clientY:y,pointerId:1,button:0,isPrimary:true});}"
+    "pill.dispatchEvent(ev('pointerdown'));pill.dispatchEvent(ev('pointerup'));pill.click();return 'opened';})()")
+
+_MODEL_PILL_LABEL_JS = (
+    "(function(){var form=document.querySelector('form');"
+    "var pill=form&&form.querySelector('button.__composer-pill[aria-haspopup=\"menu\"]');"
+    "return pill?(pill.textContent||'').trim():null;})()")
+
+
+# Chat mode nests the effort tiers under a "GPT-5.6 Sol" submenu: open that submenu, then
+# the tiers (Instant / Medium / High / Extra High / Pro) appear as [role=menuitemradio].
+_OPEN_CHAT_SUBMENU_JS = (
+    "(function(){var mi=document.querySelectorAll('[role=\"menuitem\"][aria-haspopup=\"menu\"]');"
+    "var trig=null;for(var i=0;i<mi.length;i++){if((mi[i].textContent||'').indexOf('Sol')!==-1){trig=mi[i];break;}}"
+    "if(!trig)return 'no-submenu';var r=trig.getBoundingClientRect();var x=r.x+r.width/2,y=r.y+r.height/2;"
+    "function ev(t){return new PointerEvent(t,{bubbles:true,cancelable:true,clientX:x,clientY:y,pointerId:1,isPrimary:true});}"
+    "trig.dispatchEvent(ev('pointerdown'));trig.dispatchEvent(ev('pointerup'));trig.click();return 'opened';})()")
+
+
+def _pick_radio_js(target: str) -> str:
+    """Click the [role=menuitemradio] effort tier whose trimmed text equals `target`."""
+    return ("(function(w){var r=document.querySelectorAll('[role=\"menuitemradio\"]');"
+            "for(var i=0;i<r.length;i++){if((r[i].textContent||'').trim()===w){r[i].click();return 'picked';}}"
+            "return 'no-item';})(" + json.dumps(target) + ")")
+
+
+# Work mode: the full effort range (incl. Max/Ultra, above the simple slider's cap) lives
+# in the Advanced view's "Effort" submenu. Open it, then the tiers are [role=menuitemradio].
+_OPEN_EFFORT_SUBMENU_JS = (
+    "(function(){var it=document.querySelectorAll('[role=\"menuitem\"][aria-haspopup=\"menu\"]');"
+    "var t=null;for(var i=0;i<it.length;i++){if((it[i].textContent||'').trim().indexOf('Effort')===0){t=it[i];break;}}"
+    "if(!t)return 'no-effort';var r=t.getBoundingClientRect();var x=r.x+r.width/2,y=r.y+r.height/2;"
+    "function ev(ty){return new PointerEvent(ty,{bubbles:true,cancelable:true,clientX:x,clientY:y,pointerId:1,isPrimary:true});}"
+    "t.dispatchEvent(ev('pointerover'));t.dispatchEvent(ev('pointerdown'));t.dispatchEvent(ev('pointerup'));t.click();"
+    "return 'opened';})()")
+
+# read the "Effort <tier>" row label to confirm the pick took
+_EFFORT_ROW_JS = (
+    "(function(){var it=document.querySelectorAll('[role=\"menuitem\"]');"
+    "for(var i=0;i<it.length;i++){var t=(it[i].textContent||'').trim();if(t.indexOf('Effort')===0)return t;}return null;})()")
+
+
+def _pick_effort_js(target: str) -> str:
+    """Click the [role=menuitemradio] effort tier whose text STARTS WITH `target` (the Ultra
+    row carries a 'Consumes usage limits faster' subtitle, so match by prefix not equality)."""
+    return ("(function(w){var r=document.querySelectorAll('[role=\"menuitemradio\"]');"
+            "for(var i=0;i<r.length;i++){if((r[i].textContent||'').trim().indexOf(w)===0){r[i].click();return 'picked';}}"
+            "return 'no-item';})(" + json.dumps(target) + ")")
+
+
+_MENU_ESCAPE_JS = ("document.body.dispatchEvent(new KeyboardEvent("
+                   "'keydown',{key:'Escape',bubbles:true}))")
+
+
+# --------------------------------------------------------------------------- #
 # page orchestration helpers
 # --------------------------------------------------------------------------- #
 def conv_id_from_url(url: str | None) -> str | None:
@@ -511,7 +607,103 @@ def _die_if_no_chrome():
         raise SystemExit(2)
 
 
-def open_new_chat() -> Page:
+# read-only presence probes — the toggle/pill/menu can lag the composer by a frame, and
+# the very first eval after a fresh tab opens sometimes races a re-render; poll, don't fire once.
+_RADIOS_COUNT_JS = "document.querySelectorAll('button[role=\"radio\"]').length"
+_PILL_PRESENT_JS = ("!!document.querySelector('form button.__composer-pill"
+                    "[aria-haspopup=\"menu\"]')")
+_MENUITEMRADIO_COUNT_JS = "document.querySelectorAll('[role=\"menuitemradio\"]').length"
+
+
+def _eval_until(page: Page, expr: str, pred, tries: int = 15, delay: float = 0.4):
+    """Poll `expr` until pred(result) is truthy (or tries exhausted); return the last value.
+    A raised CDP error counts as a failed attempt, not a crash — keeps actuation robust to
+    a transient re-render mid-configuration."""
+    val = None
+    for _ in range(tries):
+        try:
+            val = page.eval(expr)
+        except Exception:
+            val = None
+        if pred(val):
+            return val
+        time.sleep(delay)
+    return val
+
+
+def _set_mode(page: Page, want: str) -> bool:
+    """Select the Chat/Work segment and confirm it took (both polled)."""
+    if not _eval_until(page, _RADIOS_COUNT_JS, lambda v: isinstance(v, int) and v >= 2):
+        return False
+    for _ in range(4):
+        if page.eval(_select_mode_js(want)) == "clicked":
+            break
+        time.sleep(0.4)
+    return _eval_until(page, _READ_MODE_JS, lambda v: v == want, tries=8) == want
+
+
+def _open_model_picker(page: Page) -> bool:
+    """Wait for the composer model pill, then open its menu once (avoid double-click toggling)."""
+    if not _eval_until(page, _PILL_PRESENT_JS, lambda v: bool(v)):
+        return False
+    return page.eval(_OPEN_MODEL_PILL_JS) == "opened"
+
+
+def _set_chat_pro(page: Page) -> bool:
+    """Chat: open the GPT-5.6 Sol submenu, pick the 'Pro' effort tier, confirm the pill."""
+    if page.eval(_OPEN_CHAT_SUBMENU_JS) != "opened":
+        return False
+    if not _eval_until(page, _MENUITEMRADIO_COUNT_JS, lambda v: isinstance(v, int) and v > 0):
+        return False
+    if page.eval(_pick_radio_js(_CHAT_MODEL_ITEM)) != "picked":
+        return False
+    lab = _eval_until(page, _MODEL_PILL_LABEL_JS,
+                      lambda v: isinstance(v, str) and _CHAT_MODEL_ITEM in v, tries=6)
+    return isinstance(lab, str) and _CHAT_MODEL_ITEM in lab
+
+
+def _set_work_ultra(page: Page) -> bool:
+    """Work: open the Advanced Effort submenu, pick the strongest tier (Ultra), confirm the
+    Effort row updated. Ultra is above the simple slider's cap, so we drive the submenu."""
+    if page.eval(_OPEN_EFFORT_SUBMENU_JS) != "opened":
+        return False
+    if not _eval_until(page, _MENUITEMRADIO_COUNT_JS, lambda v: isinstance(v, int) and v > 0):
+        return False
+    if page.eval(_pick_effort_js(_WORK_EFFORT)) != "picked":
+        return False
+    row = _eval_until(page, _EFFORT_ROW_JS,
+                      lambda v: isinstance(v, str) and _WORK_EFFORT in v, tries=6)
+    return isinstance(row, str) and _WORK_EFFORT in row
+
+
+def configure_session(page: Page, mode: str | None) -> None:
+    """Put a FRESH chat into the requested tier (Chat=Pro / Work=strongest) and VERIFY it,
+    before any prompt is typed. Fail LOUD/CLOSED (SystemExit 3) if the tier can't be
+    confirmed — never silently answer on a weaker tier than the caller asked for. `mode`
+    None means 'leave the tab as-is' (backward compatible). Every actuation polls for its
+    control (a fresh tab races re-renders) and is read back to confirm it took."""
+    if not mode:
+        return
+    want = _MODE_LABEL.get(mode)
+    if want is None:
+        _err(f"unknown mode {mode!r} (expected chat|work)")
+        raise SystemExit(2)
+    if not _set_mode(page, want):
+        _err(f"could not select/confirm mode {want!r} (ChatGPT UI drift?) — fail closed")
+        raise SystemExit(3)
+    if not _open_model_picker(page):
+        _err("model picker pill not found (UI drift?) — fail closed")
+        raise SystemExit(3)
+    ok = _set_chat_pro(page) if mode == "chat" else _set_work_ultra(page)
+    if not ok:
+        tier = f"Chat/{_CHAT_MODEL_ITEM}" if mode == "chat" else f"Work/{_WORK_EFFORT}"
+        _err(f"could not pin the model tier ({tier}) (UI drift?) — fail closed")
+        raise SystemExit(3)
+    page.eval(_MENU_ESCAPE_JS)  # close the picker so it can't intercept the send
+    time.sleep(0.3)
+
+
+def open_new_chat(mode: str | None = None) -> Page:
     _die_if_no_chrome()
     page = open_tab(PROJECT_URL)
     st = _wait_composer(page)
@@ -521,6 +713,7 @@ def open_new_chat() -> Page:
     if not st:
         _err("composer never appeared (login? UI drift?)")
         raise SystemExit(3)
+    configure_session(page, mode)
     return page
 
 
@@ -609,14 +802,18 @@ def _cdp_drop_excs() -> tuple:
 
 
 def poll_answer(page: Page, rid: str, timeout: int, poll: float,
-                conversation_id: str | None = None):
+                conversation_id: str | None = None, heartbeat_cb=None):
     """Poll our request's answer node to a STABLE, finished result. Returns
     (state, answer_or_reason, model, page). state in {done, blocker, timeout}. A wrapped
     answer is accepted only once generation has stopped AND the text is unchanged across
     two polls — so content streamed after END_RESPONSE can't be truncated.
     A transient CDP drop is survived by re-attaching to `conversation_id` (bounded
     retries with backoff, fail closed if the conversation is truly gone). The returned
-    `page` is the LIVE one — callers must close it, not the page they passed in."""
+    `page` is the LIVE one — callers must close it, not the page they passed in.
+    `heartbeat_cb`, if given, is called once per poll tick — the daemon passes it so a
+    long-running job (a Pro/Ultra answer legitimately takes minutes) keeps the liveness
+    heartbeat fresh instead of looking dead to a waiting `await`. It must never break the
+    poll, so the caller wraps it fail-safe."""
     drop_excs = _cdp_drop_excs()
     deadline = time.time() + timeout
     last_done = None
@@ -624,6 +821,8 @@ def poll_answer(page: Page, rid: str, timeout: int, poll: float,
     drops = 0
     while time.time() < deadline:
         time.sleep(poll)
+        if heartbeat_cb is not None:
+            heartbeat_cb()                       # alive-but-slow != dead: keep heartbeat fresh
         try:
             raw = page.eval(_extract_js(rid))
             drops = 0                            # healthy again -> reset outage budget
@@ -782,11 +981,13 @@ def cmd_doctor(a) -> int:
 
 def cmd_gate(a) -> int:
     prompt = a.task + "\n" + "\n".join(a.link)
-    ok, res = gate(prompt, a.link, allow_gist=a.allow_gist)
+    ok, res = gate(prompt, a.link, allow_gist=a.allow_gist,
+                   allow_private=getattr(a, "private", False))
     if not ok:
         _err(res)
         return 2
-    print("gate PASS — would send. Public refs:")
+    scope = "PRIVATE-ok" if getattr(a, "private", False) else "public-only"
+    print(f"gate PASS ({scope}) — would send. Refs:")
     for i in res:
         print(f"  - {i['url']}  [{i['kind']}]")
     return 0
@@ -797,7 +998,8 @@ def _prep_consult(a):
     rid = a.rid or secrets.token_hex(4)
     role = a.role or "You are a rigorous senior engineer and reviewer."
     preview = f"{role}\n{a.title}\n{a.task}\n" + "\n".join(a.link)
-    ok, res = gate(preview, a.link, allow_gist=a.allow_gist)
+    ok, res = gate(preview, a.link, allow_gist=a.allow_gist,
+                   allow_private=getattr(a, "private", False))
     if not ok:
         _err(res)
         raise SystemExit(2)
@@ -811,7 +1013,7 @@ def cmd_consult(a) -> int:
     for i in res:
         print(f"  - {i['url']}")
     print("  task:", a.title)
-    page = open_new_chat()
+    page = open_new_chat(a.mode)
     try:
         type_and_send(page, prompt)
         state, answer, model, page = poll_answer(page, rid, a.timeout, a.poll)
@@ -839,7 +1041,7 @@ def cmd_submit(a) -> int:
     """Control plane: open chat, type, send, return rid + conversation id + wait_cmd.
     Does NOT wait — dispatch the printed wait_cmd detached."""
     rid, prompt, res = _prep_consult(a)
-    page = open_new_chat()
+    page = open_new_chat(a.mode)
     type_and_send(page, prompt)
     cid = capture_conversation_id(page)
     page.close()  # detach our client; the tab stays open for `wait`
@@ -893,7 +1095,8 @@ def cmd_followup(a) -> int:
         return 2
     resolved: list[dict] = []
     if a.link:
-        ok, res = gate(a.task + "\n" + "\n".join(a.link), a.link, allow_gist=a.allow_gist)
+        ok, res = gate(a.task + "\n" + "\n".join(a.link), a.link, allow_gist=a.allow_gist,
+                       allow_private=a.private)
         if not ok:
             _err(res)
             return 2
@@ -1009,7 +1212,8 @@ def cmd_enqueue(a) -> int:
     job = {"rid": rid, "kind": a.kind, "task": a.task, "title": a.title,
            "role": a.role, "links": list(a.link), "allow_nolink": bool(a.allow_nolink),
            "allow_gist": bool(a.allow_gist), "conversation_id": a.conversation or None,
-           "timeout": a.timeout, "out": out}
+           "timeout": a.timeout, "out": out, "mode": a.mode or None,
+           "private": bool(a.private)}
     p = _ensure_spool()
     _atomic_write(os.path.join(p["pending"], f"{rid}.json"), json.dumps(job))
     res_out = {"rid": rid, "out": out, "queued": True, "daemon_running": _daemon_alive(),
@@ -1054,7 +1258,7 @@ def cmd_await(a) -> int:
 
 
 _JOB_KEYS = {"rid", "kind", "task", "title", "role", "links", "allow_nolink",
-             "allow_gist", "conversation_id", "timeout", "out"}
+             "allow_gist", "conversation_id", "timeout", "out", "mode", "private"}
 
 
 def _process_job(job: dict) -> None:
@@ -1089,6 +1293,16 @@ def _process_job(job: dict) -> None:
     if not (isinstance(job["out"], str) and job["out"]):
         _write_status(rid, {"state": "refused", "reason": "out must be a non-empty string"})
         return
+    if job["mode"] is not None and job["mode"] not in ("chat", "work"):
+        _write_status(rid, {"state": "refused", "reason": "mode must be null|chat|work"})
+        return
+    if not isinstance(job["private"], bool):
+        _write_status(rid, {"state": "refused", "reason": "private must be a boolean"})
+        return
+    if job["kind"] == "followup" and job["mode"] is not None:
+        _write_status(rid, {"state": "refused",
+                            "reason": "followup inherits its thread's mode; mode must be null"})
+        return
     # conversation_id must satisfy its grammar BEFORE it is ever built into a URL (a bad
     # value like 'id?leak=DATA' would otherwise be requested by the browser)
     if cid is not None and not (isinstance(cid, str) and _CONV_ID_RE.fullmatch(cid)):
@@ -1113,13 +1327,15 @@ def _process_job(job: dict) -> None:
         if not ok:
             _write_status(rid, {"state": "refused", "reason": res})
             return
-        okp, resp = gate_public(res)
+        # private is an explicit, per-job opt-in re-validated HERE at the boundary (never
+        # a default): drop the public assertion but still gh-confirm the repo exists.
+        okp, resp = gate_public(res, allow_private=job["private"])
         if not okp:
             _write_status(rid, {"state": "refused", "reason": resp})
             return
         resolved = res
     if job["kind"] == "consult" and not resolved:
-        _write_status(rid, {"state": "refused", "reason": "no public link"})
+        _write_status(rid, {"state": "refused", "reason": "no code link"})
         return
     if job["kind"] == "followup" and not resolved and not job.get("allow_nolink"):
         _write_status(rid, {"state": "refused", "reason": "link-free follow-up without allow_nolink"})
@@ -1128,15 +1344,23 @@ def _process_job(job: dict) -> None:
     prompt = (render_followup(rid, task, resolved) if job["kind"] == "followup"
               else render_prompt(rid, title, role, task, resolved))
     try:
-        page = (find_conversation_page(cid) if job["kind"] == "followup" else open_new_chat())
+        page = (find_conversation_page(cid) if job["kind"] == "followup"
+                else open_new_chat(job["mode"]))
     except SystemExit as e:
         _write_status(rid, {"state": "error", "reason": f"setup (exit {e.code})"})
         return
+
+    def _hb():                                    # keep the liveness heartbeat fresh during
+        try:                                      # a long (Pro/Ultra) job so `await` on the
+            _atomic_write(_spool()["heartbeat"], str(int(time.time())))  # agent side doesn't
+        except OSError:                           # mistake alive-but-slow for daemon_not_running
+            pass
+
     try:
         type_and_send(page, prompt, expected_conversation=(cid if job["kind"] == "followup" else None))
         captured = capture_conversation_id(page) if job["kind"] == "consult" else cid
         state, ans, model, page = poll_answer(page, rid, timeout, 4.0,
-                                              conversation_id=captured)
+                                              conversation_id=captured, heartbeat_cb=_hb)
         if state == "done":
             out = write_answer(rid, ans, job["out"])
             st = {"out": str(out), "conversation_id": captured, "model": model}
@@ -1269,6 +1493,12 @@ def _add_consult_args(p):
     p.add_argument("--poll", type=float, default=4.0)
     p.add_argument("--allow-gist", action="store_true")
     p.add_argument("--close-tab", action="store_true")
+    p.add_argument("--mode", choices=["chat", "work"], default="",
+                   help="tier for a fresh chat: chat=Pro (fast) / work=strongest (deep). "
+                        "Default: leave the tab as-is.")
+    p.add_argument("--private", action="store_true",
+                   help="allow non-public repos (consulted via ChatGPT's own GitHub "
+                        "connector); still secret-scanned, still gh-existence-checked")
 
 
 def main() -> int:
@@ -1283,6 +1513,8 @@ def main() -> int:
     g.add_argument("--task", required=True)
     g.add_argument("--link", action="append", default=[], required=True)
     g.add_argument("--allow-gist", action="store_true")
+    g.add_argument("--private", action="store_true",
+                   help="dry-run the private-ok gate (drop the public assertion)")
     g.set_defaults(fn=cmd_gate)
 
     c = sub.add_parser("consult", help="blocking: submit + wait in one go")
@@ -1312,6 +1544,8 @@ def main() -> int:
     f.add_argument("--rid", default="")
     f.add_argument("--timeout", type=int, default=900)
     f.add_argument("--allow-gist", action="store_true")
+    f.add_argument("--private", action="store_true",
+                   help="allow non-public repos in this follow-up round")
     f.set_defaults(fn=cmd_followup)
 
     st = sub.add_parser("status", help="one-shot state of a conversation")
@@ -1332,6 +1566,10 @@ def main() -> int:
     e.add_argument("--rid", default="")
     e.add_argument("--timeout", type=int, default=900)
     e.add_argument("--allow-gist", action="store_true")
+    e.add_argument("--mode", choices=["chat", "work"], default="",
+                   help="tier for a fresh chat: chat=Pro / work=strongest (ignored on followup)")
+    e.add_argument("--private", action="store_true",
+                   help="allow non-public repos (re-validated by the daemon at send)")
     e.set_defaults(fn=cmd_enqueue)
 
     aw = sub.add_parser("await", help="agent side: poll the local answer status (no network)")
