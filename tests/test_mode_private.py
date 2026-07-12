@@ -331,6 +331,82 @@ def test_slug_ok_unit():
 # --------------------------------------------------------------------------- #
 # #5: a fail-closed tier error closes the tab instead of leaking it
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# #1: mode-aware generous timeouts (Pro/Ultra legitimately run tens of minutes)
+# --------------------------------------------------------------------------- #
+def test_default_timeout_mode_aware():
+    assert gptc._default_timeout("work") == 3000
+    assert gptc._default_timeout("chat") == 1800
+    assert gptc._default_timeout(None) == 1800
+
+
+def test_resolve_timeout_explicit_wins_and_clamps():
+    assert gptc._resolve_timeout(types.SimpleNamespace(timeout=None, mode="work")) == 3000
+    assert gptc._resolve_timeout(types.SimpleNamespace(timeout=None, mode="")) == 1800
+    assert gptc._resolve_timeout(types.SimpleNamespace(timeout=50, mode="work")) == 50
+    assert gptc._resolve_timeout(types.SimpleNamespace(timeout=99999, mode="work")) == 3600
+
+
+# --------------------------------------------------------------------------- #
+# #2: unwrapped-answer salvage on timeout (don't lose a long reasoning result)
+# --------------------------------------------------------------------------- #
+class _SalvagePage:
+    def __init__(self, found=True, text="PARTIAL ANSWER"):
+        self.found, self.text = found, text
+
+    def eval(self, expr):
+        if "found" in expr:  # _salvage_js
+            return json.dumps({"found": self.found, "text": self.text,
+                               "model": "sol", "generating": True})
+        return json.dumps({"state": "generating", "generating": True})  # _extract_js
+
+    def close(self):
+        pass
+
+
+def test_poll_answer_salvages_unwrapped_on_timeout(monkeypatch):
+    monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)
+    state, text, model, _ = gptc.poll_answer(_SalvagePage(), "abcd1234", timeout=0, poll=0.0)
+    assert state == "salvaged" and text == "PARTIAL ANSWER" and model == "sol"
+
+
+def test_poll_answer_plain_timeout_when_nothing_to_salvage(monkeypatch):
+    monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)
+    state, text, _, _ = gptc.poll_answer(_SalvagePage(found=False), "abcd1234",
+                                         timeout=0, poll=0.0)
+    assert state == "timeout" and text is None
+
+
+def test_daemon_writes_partial_on_salvage(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "ANSWER_DIR", str(tmp_path))
+    monkeypatch.setattr(gptc, "_repo_is_public", lambda s: True)
+
+    class _P:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gptc, "open_new_chat", lambda mode=None: _P())
+    monkeypatch.setattr(gptc, "type_and_send", lambda *a, **k: None)
+    monkeypatch.setattr(gptc, "capture_conversation_id", lambda *a, **k: "b" * 20)
+    monkeypatch.setattr(gptc, "poll_answer",
+                        lambda page, rid, t, poll, **k: ("salvaged", "PARTIAL", "sol", page))
+    gptc._ensure_spool()
+    gptc._process_job(_raw(rid="70707070", out="answer.txt"))
+    st = _status(tmp_path, "70707070")
+    assert st["state"] == "salvaged" and st["out"].endswith(".partial")
+    assert Path(st["out"]).read_text() == "PARTIAL"
+
+
+def test_await_returns_5_on_salvaged(tmp_path, monkeypatch):
+    monkeypatch.setattr(gptc, "SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(gptc, "_hard_deadline", lambda *_: None)  # don't arm SIGALRM in tests
+    gptc._ensure_spool()
+    gptc._write_status("80808080", {"state": "salvaged", "out": "/x.partial", "model": "sol"})
+    a = types.SimpleNamespace(rid="80808080", out="", timeout=5, poll=0.0)
+    assert gptc.cmd_await(a) == 5
+
+
 def test_open_new_chat_closes_tab_on_configure_failure(monkeypatch):
     closed = {"target": 0, "client": 0}
 

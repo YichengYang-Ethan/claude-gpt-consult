@@ -63,8 +63,16 @@ python3 $SCRIPT await --rid <rid> --out <out> --timeout 900
 
 ### `await` exit codes
 `0` answer written to `<out>` · `3` blocker (login/captcha/rate-limit — ask the USER to
-clear it in the ChatGPT window, then re-enqueue) · `4` no wrapped answer · `2` setup
-error — usually `daemon_not_running` → ask the USER to run `gptc watch`.
+clear it in the ChatGPT window, then re-enqueue) · `4` no answer (the model may still have
+been reasoning — re-enqueue with a larger `--timeout`) · **`5` salvaged PARTIAL answer**
+written to `<out>.partial` (the model answered but without the sentinel wrapper, or the
+deadline clipped it — treat as UNVERIFIED; re-enqueue if you need a clean, complete one) ·
+`2` setup error — usually `daemon_not_running` → ask the USER to run `gptc watch`.
+
+**Timeouts:** don't set them tight. Pro/Ultra reasoning legitimately runs **30–50 minutes**;
+the ceiling is mode-aware by default (`work`≈3000s, else 1800s, capped at 3600) and `await`
+outlives the job's own window. A long wait is the model thinking, not a hang — never treat
+it as stuck.
 
 ## Follow-up rounds (feed local results back)
 Continue the SAME thread (keeps ChatGPT's context + model). Capture the conversation id
