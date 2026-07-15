@@ -318,17 +318,19 @@ def model_downgrade_warning(model: str | None, expect: str) -> str | None:
     return None if expect.lower() in model.lower() else f"answered by {model!r}, expected ~{expect!r}"
 
 
-_OUTPUT_CONTRACT = """--- OUTPUT CONTRACT (read carefully) ---
-Take as long as you need to reason. When your FINAL answer is ready, print it wrapped
-EXACTLY like this — each sentinel alone on its own line, nothing else on that line,
-and NOT inside a code fence:
+_OUTPUT_CONTRACT = """--- OUTPUT CONTRACT ---
+Reason for as long as you need. When your FINAL answer is ready, print it wrapped EXACTLY
+like this — each sentinel alone on its own line, nothing else on the line, NOT inside a
+code fence:
 
 BEGIN_RESPONSE:{rid}
-<your complete final answer here>
+<your complete final answer>
 END_RESPONSE:{rid}
 
-Emit the BEGIN line exactly once, at the start of the final answer. End the load-bearing
-claims a local agent should re-check with a short `verify locally:` note."""
+Emit the BEGIN line once, at the start of the final answer. Ground load-bearing claims in
+what you actually read from the code above; label inference separately from what the sources
+state, and if a fact is missing, say so rather than guess. End each claim a local agent
+should re-check with a short `verify locally:` note."""
 
 
 def render_prompt(rid: str, title: str, role: str, task: str, resolved: list[dict]) -> str:

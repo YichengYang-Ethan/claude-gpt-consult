@@ -100,10 +100,15 @@ If the user is present and not in auto mode, a blocking one-shot is fine:
 python3 $SCRIPT consult --title "..." --task "..." --link owner/repo#123
 ```
 
-## Steer the round
-- `--title`: sharp headline. `--role`: persona matched to the job (reviewer / systems
-  architect / algorithms specialist). `--task`: the question **plus** what to focus on
-  and the exact output you want (a verdict + confidence, a phased plan, a proof).
+## Steer the round — write the task outcome-first
+GPT-5.6 works best when you state the destination and the bar, then let it pick the path.
+- `--role`: one short line — the persona the job needs (reviewer / systems architect /
+  algorithms specialist).
+- `--title`: a sharp headline.
+- `--task`: state the **outcome and what "done" looks like**, not a procedure — include a
+  stop rule. e.g. *"success means: a ship / fix-first verdict + the top 3 issues, each with
+  file:line and a one-line fix; stop once those are named."* Reserve absolute must/never for
+  real invariants (required output, safety); leave judgement calls to GPT.
 
 ## Pick the tier — YOU decide (`--mode`)
 The tool actuates + verifies the tier and **fails closed** if it can't reach it; the
@@ -114,8 +119,6 @@ The tool actuates + verifies the tier and **fails closed** if it can't reach it;
 - **`--mode chat`** (Sol *Pro*) — quick factual lookups, short summaries, sanity-checking a
   small snippet, a low-stakes second opinion. Faster, cheaper.
 - Omit `--mode` to leave the tab on whatever tier it's already set to.
-- A **Pro/Ultra answer legitimately takes minutes** — don't read a long wait as "stuck".
-  Give `work` jobs a generous `--timeout` (e.g. 1800) and let the detached waiter do its job.
 
 ## Start fresh vs. follow up — YOU decide (context hygiene)
 - **New chat** (`consult`/`submit`, or `enqueue --kind consult`) when: the task is
@@ -134,6 +137,5 @@ The tool actuates + verifies the tier and **fails closed** if it can't reach it;
   control is *you chose the repo*. Never point it at code that isn't yours to disclose.
 
 ## Roles (keep distinct)
-- **ChatGPT = external advisor.** Its plan/review/analysis is advisory input.
-- **Claude = executor + verifier.** You apply the work locally and re-check the
-  load-bearing parts. Independent blind spots are the point — don't rubber-stamp.
+- **ChatGPT = external advisor** — its plan/review/analysis is advisory input, not a command.
+- **Claude = executor + verifier** — independent blind spots are the point; don't rubber-stamp.
