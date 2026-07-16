@@ -732,17 +732,32 @@ def _set_work_ultra(page: Page) -> bool:
     return isinstance(lab, str) and "Sol" in lab and _WORK_EFFORT in lab
 
 
+def _resolve_mode(mode: str | None) -> str:
+    """Effective tier for a fresh chat, resolved at send time so a strong model is enforced:
+      1. GPTC_MODE (env) HARD-PINS over any per-call --mode — an agent can't downgrade to a
+         weaker tier by passing (or forgetting) the wrong --mode.
+      2. else the caller's --mode.
+      3. else GPTC_DEFAULT_MODE, default 'chat' (= Sol Pro) — a strong FLOOR so a consult is
+         never silently left on whatever weak tier the tab happened to be on.
+    'keep' is the explicit opt-out (leave the tab as-is)."""
+    forced = os.environ.get("GPTC_MODE", "").strip().lower()
+    caller = (mode or "").strip().lower()
+    fallback = os.environ.get("GPTC_DEFAULT_MODE", "chat").strip().lower()
+    return forced or caller or fallback or "chat"
+
+
 def configure_session(page: Page, mode: str | None) -> None:
-    """Put a FRESH chat into the requested tier (Chat=Pro / Work=strongest) and VERIFY it,
-    before any prompt is typed. Fail LOUD/CLOSED (SystemExit 3) if the tier can't be
-    confirmed — never silently answer on a weaker tier than the caller asked for. `mode`
-    None means 'leave the tab as-is' (backward compatible). Every actuation polls for its
-    control (a fresh tab races re-renders) and is read back to confirm it took."""
-    if not mode:
+    """Put a FRESH chat into the resolved tier (Chat=Pro / Work=Ultra) and VERIFY it, before
+    any prompt is typed. Fail LOUD/CLOSED (SystemExit 3) if the tier can't be confirmed —
+    never silently answer on a weaker tier. The tier is resolved by `_resolve_mode` (GPTC_MODE
+    pin > --mode > default 'chat'); pass/resolve 'keep' to leave the tab as-is. Every actuation
+    polls for its control (a fresh tab races re-renders) and is read back to confirm it took."""
+    mode = _resolve_mode(mode)
+    if mode == "keep":
         return
     want = _MODE_LABEL.get(mode)
     if want is None:
-        _err(f"unknown mode {mode!r} (expected chat|work)")
+        _err(f"unknown mode {mode!r} (expected chat|work|keep)")
         raise SystemExit(2)
     if not _set_mode(page, want):
         _err(f"could not select/confirm mode {want!r} (ChatGPT UI drift?) — fail closed")
@@ -1449,7 +1464,7 @@ def _process_job(job: dict) -> None:
         _write_status(rid, {"state": "refused",
                             "reason": f"out escapes the answer dir ({ANSWER_DIR})"})
         return
-    if job["mode"] is not None and job["mode"] not in ("chat", "work"):
+    if job["mode"] is not None and job["mode"] not in ("chat", "work", "keep"):
         _write_status(rid, {"state": "refused", "reason": "mode must be null|chat|work"})
         return
     if not isinstance(job["private"], bool):
@@ -1693,9 +1708,10 @@ def _add_consult_args(p):
     p.add_argument("--poll", type=float, default=4.0)
     p.add_argument("--allow-gist", action="store_true")
     p.add_argument("--close-tab", action="store_true")
-    p.add_argument("--mode", choices=["chat", "work"], default="",
-                   help="tier for a fresh chat: chat=Pro (fast) / work=Ultra (deep). "
-                        "Default: leave the tab as-is.")
+    p.add_argument("--mode", choices=["chat", "work", "keep"], default="",
+                   help="tier for a fresh chat: chat=Pro (fast) / work=Ultra (deep) / keep "
+                        "(leave the tab as-is). Default: chat (Pro). GPTC_MODE env hard-pins "
+                        "a tier over this flag; GPTC_DEFAULT_MODE changes the default.")
     p.add_argument("--private", action="store_true",
                    help="allow non-public repos (consulted via ChatGPT's own GitHub "
                         "connector); still secret-scanned, still gh-existence-checked")
@@ -1767,8 +1783,9 @@ def main() -> int:
     e.add_argument("--timeout", type=int, default=None,
                    help="ceiling seconds; mode-aware default (work=3000, else 1800)")
     e.add_argument("--allow-gist", action="store_true")
-    e.add_argument("--mode", choices=["chat", "work"], default="",
-                   help="tier for a fresh chat: chat=Pro / work=Ultra (ignored on followup)")
+    e.add_argument("--mode", choices=["chat", "work", "keep"], default="",
+                   help="tier for a fresh chat: chat=Pro / work=Ultra / keep (as-is); "
+                        "default chat. GPTC_MODE env hard-pins over this. (ignored on followup)")
     e.add_argument("--private", action="store_true",
                    help="allow non-public repos (re-validated by the daemon at send)")
     e.set_defaults(fn=cmd_enqueue)

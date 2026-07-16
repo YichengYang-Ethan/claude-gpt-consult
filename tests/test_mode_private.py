@@ -12,6 +12,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gptc  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_mode_env(monkeypatch):
+    """Tier resolution reads GPTC_MODE / GPTC_DEFAULT_MODE from the env; keep tests hermetic."""
+    monkeypatch.delenv("GPTC_MODE", raising=False)
+    monkeypatch.delenv("GPTC_DEFAULT_MODE", raising=False)
+
+
+# --------------------------------------------------------------------------- #
+# tier resolution — a strong tier is enforced (GPTC_MODE pin > --mode > default chat)
+# --------------------------------------------------------------------------- #
+def test_resolve_mode_defaults_to_chat_pro():
+    assert gptc._resolve_mode(None) == "chat"
+    assert gptc._resolve_mode("") == "chat"
+
+
+def test_resolve_mode_uses_caller_flag():
+    assert gptc._resolve_mode("work") == "work"
+
+
+def test_resolve_mode_env_hard_pins_over_flag(monkeypatch):
+    monkeypatch.setenv("GPTC_MODE", "work")
+    assert gptc._resolve_mode("chat") == "work"   # pin overrides an agent's weaker choice
+    assert gptc._resolve_mode(None) == "work"
+
+
+def test_resolve_mode_default_env_moves_the_floor(monkeypatch):
+    monkeypatch.setenv("GPTC_DEFAULT_MODE", "work")
+    assert gptc._resolve_mode(None) == "work"
+    assert gptc._resolve_mode("chat") == "chat"   # explicit flag still wins over the default
+
+
 # --------------------------------------------------------------------------- #
 # private-repo opt-in at the network gate
 # --------------------------------------------------------------------------- #
@@ -218,11 +249,22 @@ class _EscPage:
         return None
 
 
-def test_configure_session_noop_when_mode_unset(monkeypatch):
+def test_configure_session_keep_is_the_only_noop(monkeypatch):
     calls = []
     monkeypatch.setattr(gptc, "_set_mode", lambda *a, **k: calls.append(1) or True)
+    gptc.configure_session(_EscPage(), "keep")   # explicit opt-out — leave the tab as-is
+    assert calls == []
+
+
+def test_configure_session_default_enforces_chat_pro(monkeypatch):
+    # a forgotten --mode (None) must NOT be a no-op — it actuates the strong default (Pro)
+    monkeypatch.setattr(gptc.time, "sleep", lambda *_: None)
+    _patch_helpers(monkeypatch)
+    called = {}
+    monkeypatch.setattr(gptc, "_set_chat_pro", lambda p: called.setdefault("chat", True) or True)
+    monkeypatch.setattr(gptc, "_set_work_ultra", lambda p: called.setdefault("work", True) or True)
     gptc.configure_session(_EscPage(), None)
-    assert calls == []  # nothing actuated
+    assert called == {"chat": True}  # defaulted to Pro, not left as-is, not Ultra
 
 
 def test_configure_session_unknown_mode_is_setup_error():
