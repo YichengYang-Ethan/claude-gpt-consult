@@ -214,6 +214,8 @@ the job window. Don't read a long wait as a hang.
 | `GPTC_PROFILE` | `~/.gptc-chrome` | dedicated Chrome profile dir |
 | `GPTC_CHROME` | auto-detect | explicit browser binary |
 | `GPTC_ANSWER_DIR` | `./gptc_answers` | where answers are written |
+| `GPTC_MODE` | unset | **hard-pin** the tier for every fresh consult (`work`=Ultra / `chat`=Pro / `keep`=as-is). Overrides any per-call `--mode` so an agent can't pick a weaker tier. |
+| `GPTC_DEFAULT_MODE` | `chat` | tier used when neither `GPTC_MODE` nor `--mode` is given. `chat` (Sol Pro) is a strong floor — a consult is never left on a weak tab default. |
 | `GPTC_EXPECT_MODEL` | unset | substring of the model you pinned (e.g. `thinking`); if the answer came from a different model, a downgrade warning is surfaced (read-only, never selects) |
 
 ## What this version does NOT do (yet)

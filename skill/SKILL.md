@@ -110,15 +110,19 @@ GPT-5.6 works best when you state the destination and the bar, then let it pick 
   file:line and a one-line fix; stop once those are named."* Reserve absolute must/never for
   real invariants (required output, safety); leave judgement calls to GPT.
 
-## Pick the tier — YOU decide (`--mode`)
-The tool actuates + verifies the tier and **fails closed** if it can't reach it; the
-*judgement* of which tier a task needs is yours. Default to Chat; escalate deliberately.
-- **`--mode work`** (Sol **Ultra** — the strongest effort tier) — deep architecture review, large /
-  multi-file PRs, hard algorithmic or proof work, multi-step agentic planning; anything
-  where a wrong answer is expensive and you'll act on it. Slower, burns the Ultra-tier quota.
-- **`--mode chat`** (Sol *Pro*) — quick factual lookups, short summaries, sanity-checking a
-  small snippet, a low-stakes second opinion. Faster, cheaper.
-- Omit `--mode` to leave the tab on whatever tier it's already set to.
+## Pick the tier (`--mode`) — a strong tier is ENFORCED
+A fresh consult is ALWAYS put on a strong tier and verified (**fails closed** if it can't) —
+it is never left on whatever weak tier the tab happened to be on. Default is **`chat` = Sol
+Pro**. Pick by task:
+- **`--mode work`** (Sol **Ultra**, the strongest effort tier) — deep architecture review, large /
+  multi-file PRs, hard algorithmic or proof work, multi-step agentic planning; anything where a
+  wrong answer is expensive. Slower, burns Ultra quota.
+- **`--mode chat`** (Sol **Pro**) — quick lookups, short summaries, sanity-checking a snippet, a
+  low-stakes second opinion. Faster. **This is the default**, so a forgotten `--mode` still gets
+  Pro, never a weaker tier.
+- **`--mode keep`** — the only way to leave the tab as-is (rarely needed).
+- The USER can **hard-pin** every consult with `GPTC_MODE=work` (or `chat`) — it overrides this
+  flag so the tier can't be gotten wrong. If it's set, don't fight it.
 
 ## Start fresh vs. follow up — YOU decide (context hygiene)
 - **New chat** (`consult`/`submit`, or `enqueue --kind consult`) when: the task is
